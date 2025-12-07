@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE/Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Local settings
+.claude/
+
+# External dependencies (cloned separately)
+HyperPixel2r/
