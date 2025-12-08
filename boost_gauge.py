@@ -30,11 +30,24 @@ from touch import TouchHandler, GestureType
 try:
     from hotspot import start_hotspot, stop_hotspot, is_hotspot_active
     from settings_server import start_server, stop_server
-    from bluetooth import get_bt_status, scan_devices, pair_device, connect_obd, BTStatus
+    from bt_manager import (get_bt_status, scan_devices, pair_device, connect_obd, BTStatus,
+                            create_obd_connection, has_socket_support)
     MODULES_AVAILABLE = True
 except ImportError as e:
     print(f"Warning: Some modules not available: {e}")
     MODULES_AVAILABLE = False
+    has_socket_support = lambda: False
+
+# Import OBD socket module for direct Bluetooth communication
+try:
+    from obd_socket import OBDSocket, ConnectionState, OBDData
+    OBD_SOCKET_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: OBD socket module not available: {e}")
+    OBD_SOCKET_AVAILABLE = False
+    OBDSocket = None
+    ConnectionState = None
+    OBDData = None
 
 # Try to import QR code library
 try:
@@ -99,12 +112,12 @@ class BoostGaugeTest:
         self.fps = 0
 
         # 2D Screen grid navigation
-        # Row 0: Gauges (boost, temp, engine load) - 3 columns
+        # Row 0: Gauges (boost, temp, engine load, SHIFT LIGHT) - 4 columns
         # Row 1: QR Settings (col 0), Bluetooth (col 1) - 2 columns
         # Row 2: Brightness slider - 1 column
         self.screen_col = 0  # Current column
         self.screen_row = 0  # Current row
-        self.row_cols = [3, 2, 1]  # Number of columns per row
+        self.row_cols = [4, 2, 1]  # Number of columns per row (4th column = shift light)
         self.num_rows = 3    # 3 rows (gauges + settings/BT + brightness)
 
         # Brightness setting (10-100%)
@@ -134,6 +147,13 @@ class BoostGaugeTest:
         # Demo/test mode - needle sweep animation when not connected to OBD
         self.demo_mode = True  # Start with demo mode ON
         self.demo_time = 0.0   # For animation timing
+
+        # OBD Socket Connection (new socket-based approach)
+        self.obd_connection = None  # OBDSocket instance
+        self.obd_state = "disconnected"  # disconnected, connecting, connected, error
+        self.obd_state_msg = ""
+        self.obd_connected = False
+        self.obd_connecting = False
 
         # Pending system action (reboot/shutdown) - executed after clean exit
         self._pending_action = None  # 'reboot' or 'shutdown'
@@ -207,6 +227,15 @@ class BoostGaugeTest:
             'OIL_TEMP': 210.0,
             'FUEL_PRESSURE': 45.0,
         }
+
+        # Shift Light Settings (RS7 4.0T redline is ~6800, APR tune safe to 7000)
+        self.shift_rpm_target = 6500   # When to shift (BRIGHT RED FLASH)
+        self.shift_rpm_warning = 500   # RPM before target to show yellow warning
+        self.shift_strobe_hz = 10      # Flash rate when over-revving
+        self.shift_flash_state = False # Toggle for strobe effect
+        self.shift_last_flash = 0      # Time of last flash toggle
+        self.current_rpm = 0.0         # Smoothed RPM for display
+        self.target_rpm = 0.0          # Target RPM from OBD
 
         # Touch handler - initialized at module level to avoid GPIO conflicts
         # See end of file for touch setup
@@ -543,17 +572,13 @@ class BoostGaugeTest:
                     print("Tap -> Starting BT scan...")
                     self._start_bt_scan()
                 else:
-                    # Right side - PAIR/CONNECT
+                    # Right side - PAIR/CONNECT OBD
                     if self.bt_devices and self.bt_selected_device < len(self.bt_devices):
                         device = self.bt_devices[self.bt_selected_device]
-                        print(f"Tap -> Pairing with {device.name}...")
-                        if MODULES_AVAILABLE:
-                            try:
-                                pair_device(device.mac)
-                                connect_obd(device.mac)
-                                self.bt_status = get_bt_status(device.mac)
-                            except Exception as e:
-                                print(f"Pair/connect failed: {e}")
+                        if not self.obd_connecting:
+                            print(f"Tap -> Connecting OBD to {device.name}...")
+                            # Start connection in background thread (includes pairing)
+                            self._start_obd_connection_async(device.mac)
             elif 150 < y < 330 and self.bt_devices:
                 # Device list area - select device
                 # Calculate which device was tapped
@@ -929,6 +954,86 @@ class BoostGaugeTest:
         ]
         self._draw_generic_gauge(load, 0, 100, "%", "ENGINE LOAD", color_zones)
 
+    def _draw_shift_light_screen(self):
+        """Draw full-screen shift light for peripheral vision.
+
+        FULL-SCREEN peripheral vision indicator:
+        - BLACK: Below warning zone (clean, no distraction)
+        - YELLOW GLOW: Approaching target (RPM - warning threshold)
+        - BRIGHT RED FLASH: At target RPM - ENTIRE SCREEN FLASHES RED
+        - RAPID STROBE: Over rev - alternating red/white flash
+
+        Performance critical: minimize rendering for <16ms frame time.
+        """
+        # Get current RPM (from OBD data or simulated values)
+        rpm = self.simulated_values.get('RPM', 0)
+
+        # Update smoothed RPM for display
+        dt = 1.0 / 30.0  # Assume ~30 FPS
+        rpm_diff = rpm - self.current_rpm
+        self.current_rpm += rpm_diff * 0.3  # Fast response for shift light
+
+        now = time.time()
+        warning_start = self.shift_rpm_target - self.shift_rpm_warning
+
+        # Determine screen color based on RPM
+        if rpm >= self.shift_rpm_target:
+            # OVER TARGET - BRIGHT RED or STROBE
+            if rpm > self.shift_rpm_target + 200:
+                # OVER-REV - RAPID STROBE (red/white)
+                strobe_period = 1.0 / self.shift_strobe_hz
+                if now - self.shift_last_flash >= strobe_period:
+                    self.shift_flash_state = not self.shift_flash_state
+                    self.shift_last_flash = now
+
+                if self.shift_flash_state:
+                    bg_color = (255, 255, 255)  # WHITE flash
+                else:
+                    bg_color = (255, 0, 0)  # RED flash
+            else:
+                # AT TARGET - SOLID BRIGHT RED
+                bg_color = (255, 0, 0)
+        elif rpm >= warning_start:
+            # WARNING ZONE - YELLOW GLOW (intensity increases approaching target)
+            warning_pct = (rpm - warning_start) / self.shift_rpm_warning
+            # Fade from dark to yellow
+            intensity = int(warning_pct * 255)
+            bg_color = (intensity, intensity, 0)  # Yellow
+        else:
+            # BELOW WARNING - BLACK (no distraction)
+            bg_color = (0, 0, 0)
+
+        # Fill entire screen with color (fastest possible operation)
+        self.screen.fill(bg_color)
+
+        # Small RPM readout in bottom corner (not the focus, just reference)
+        # Use contrasting color for visibility
+        if bg_color == (0, 0, 0):
+            text_color = (80, 80, 80)  # Dim gray on black
+        elif bg_color[0] > 200 or bg_color[1] > 200:  # Bright background
+            text_color = (0, 0, 0)  # Black text
+        else:
+            text_color = (255, 255, 255)  # White text
+
+        # RPM number - large enough to glance at but not the focus
+        rpm_text = self._font_large.render(f"{int(self.current_rpm)}", True, text_color)
+        rpm_rect = rpm_text.get_rect(center=(240, 400))
+        self.screen.blit(rpm_text, rpm_rect)
+
+        # Shift target indicator (small)
+        target_text = self._font_tiny.render(f"SHIFT @ {self.shift_rpm_target}", True, text_color)
+        target_rect = target_text.get_rect(center=(240, 440))
+        self.screen.blit(target_text, target_rect)
+
+        # Draw circular mask to maintain round display appearance
+        # (Only draw edges to save performance - center is already filled)
+        for angle in range(0, 360, 2):
+            for r in range(220, 240):
+                x = int(240 + r * math.cos(math.radians(angle)))
+                y = int(240 + r * math.sin(math.radians(angle)))
+                if 0 <= x < 480 and 0 <= y < 480:
+                    self.screen.set_at((x, y), (0, 0, 0))
+
     def _draw_mini_gauge_preview(self, center_x, center_y, pid_info):
         """Draw a small preview gauge for PID selection."""
         pid_id, name, unit, min_val, max_val, color_preset = pid_info
@@ -1071,8 +1176,34 @@ class BoostGaugeTest:
         title_rect = title.get_rect(center=(240, 55))
         self.screen.blit(title, title_rect)
 
-        # Connection status
-        if self.bt_status:
+        # Connection status - Show OBD socket status if available, otherwise BT pairing status
+        if self.obd_connected or self.obd_connecting or self.obd_state == "error":
+            # OBD Socket connection status (takes priority)
+            if self.obd_connected:
+                status_color = self.GREEN
+                status_text = "OBD Connected"
+            elif self.obd_connecting:
+                status_color = self.YELLOW
+                status_text = "Connecting..."
+            else:  # error
+                status_color = self.RED
+                status_text = self.obd_state_msg[:25] if self.obd_state_msg else "Error"
+
+            # Status indicator circle
+            gfxdraw.aacircle(self.screen, 170, 90, 8, status_color)
+            gfxdraw.filled_circle(self.screen, 170, 90, 8, status_color)
+
+            # Device/connection info
+            obd_label = self._font_small.render("OBD-II Data", True, self.WHITE)
+            obd_rect = obd_label.get_rect(midleft=(190, 90))
+            self.screen.blit(obd_label, obd_rect)
+
+            # Status text
+            status_surface = self._font_tiny.render(status_text, True, status_color)
+            status_rect = status_surface.get_rect(midleft=(190, 115))
+            self.screen.blit(status_surface, status_rect)
+
+        elif self.bt_status:
             if self.bt_status.connected:
                 status_color = self.GREEN
                 status_text = "Connected"
@@ -1344,6 +1475,158 @@ class BoostGaugeTest:
 
         setattr(self, attr_name, new_value)
 
+    # =========================================================================
+    # OBD Socket Connection Methods
+    # =========================================================================
+
+    def _obd_state_callback(self, state, msg):
+        """Called by OBDSocket when connection state changes."""
+        if ConnectionState:
+            self.obd_state = state.value
+        else:
+            self.obd_state = str(state)
+        self.obd_state_msg = msg
+        self.obd_connected = (state == ConnectionState.CONNECTED) if ConnectionState else False
+        self.obd_connecting = (state == ConnectionState.CONNECTING or
+                               state == ConnectionState.INITIALIZING) if ConnectionState else False
+        print(f"[OBD] State: {self.obd_state} - {msg}")
+
+    def _obd_data_callback(self, data):
+        """Called by OBDSocket with new OBD data."""
+        if not data:
+            return
+
+        # Update gauge targets from OBD data
+        self.boost_target = data.boost_psi
+        self.coolant_target = data.coolant_temp_f
+
+        # Map engine load from other PIDs if available
+        if data.throttle_pos > 0:
+            self.engine_load_target = data.throttle_pos
+
+        # Update simulated values for settings preview
+        self.simulated_values['BOOST'] = data.boost_psi
+        self.simulated_values['COOLANT_TEMP'] = data.coolant_temp_f
+        self.simulated_values['INTAKE_TEMP'] = data.intake_temp_c * 9/5 + 32  # C to F
+        self.simulated_values['RPM'] = data.rpm
+        self.simulated_values['THROTTLE_POS'] = data.throttle_pos
+
+    def _start_obd_connection_async(self, mac):
+        """Start OBD connection process in background (includes pairing)."""
+        if self.obd_connecting:
+            print("[OBD] Already connecting...")
+            return
+
+        def connection_thread():
+            try:
+                self.obd_connecting = True
+                self.obd_state = "connecting"
+                self.obd_state_msg = "Pairing..."
+
+                # First ensure device is paired (this can block)
+                if MODULES_AVAILABLE:
+                    try:
+                        pair_device(mac)
+                        self.bt_status = get_bt_status(mac)
+                    except Exception as e:
+                        print(f"[OBD] Pairing warning: {e}")
+                        # Continue anyway - might already be paired
+
+                self.obd_state_msg = f"Connecting to {mac}..."
+
+                # Now do socket connection
+                if OBD_SOCKET_AVAILABLE:
+                    self._do_socket_connect(mac)
+                elif MODULES_AVAILABLE:
+                    # Fall back to old rfcomm method
+                    print(f"[OBD] Falling back to rfcomm connection")
+                    connect_obd(mac)
+                    self.obd_state = "connected"
+                    self.obd_state_msg = "Connected (rfcomm)"
+                else:
+                    self.obd_state = "error"
+                    self.obd_state_msg = "No connection method available"
+
+            except Exception as e:
+                print(f"[OBD] Connection error: {e}")
+                self.obd_state = "error"
+                self.obd_state_msg = str(e)[:30]
+            finally:
+                self.obd_connecting = False
+
+        thread = threading.Thread(target=connection_thread, daemon=True)
+        thread.start()
+
+    def _do_socket_connect(self, address):
+        """Internal: perform socket-based OBD connection (called from thread).
+
+        Args:
+            address: Either a Bluetooth MAC (AA:BB:CC:DD:EE:FF) or TCP (host:port)
+        """
+        # Disconnect existing connection first
+        self.disconnect_obd_socket()
+
+        # Determine if TCP or Bluetooth mode
+        use_tcp = False
+        if address.startswith("tcp:"):
+            use_tcp = True
+            address = address[4:]  # Remove "tcp:" prefix
+
+        if ":" in address and address.count(":") != 5:  # Not a MAC address
+            # TCP mode: host:port
+            use_tcp = True
+            parts = address.split(":")
+            host = parts[0]
+            port = int(parts[1]) if len(parts) > 1 else 35000
+            addr = host
+            channel_or_port = port
+        else:
+            # Bluetooth mode
+            addr = address
+            channel_or_port = 1
+
+        try:
+            # Create OBDSocket with callbacks
+            print(f"[OBD] Connecting via {'TCP' if use_tcp else 'Bluetooth'} to {addr}:{channel_or_port}")
+            self.obd_connection = OBDSocket(addr, channel_or_port, use_tcp=use_tcp)
+            self.obd_connection.set_state_callback(self._obd_state_callback)
+            self.obd_connection.set_data_callback(self._obd_data_callback)
+
+            if self.obd_connection.connect():
+                # Start polling at 10 Hz
+                self.obd_connection.start_polling(rate_hz=10)
+                # Turn off demo mode when connected
+                self.demo_mode = False
+                print("[OBD] Connected and polling started")
+            else:
+                self.obd_state = "error"
+                self.obd_state_msg = "Connection failed"
+                self.obd_connection = None
+
+        except Exception as e:
+            print(f"[OBD] Socket connection error: {e}")
+            self.obd_state = "error"
+            self.obd_state_msg = str(e)[:30]
+            self.obd_connection = None
+
+    def connect_obd_socket(self, mac):
+        """Connect to OBD adapter using socket-based approach (legacy wrapper)."""
+        self._start_obd_connection_async(mac)
+
+    def disconnect_obd_socket(self):
+        """Disconnect from OBD adapter."""
+        if self.obd_connection:
+            try:
+                self.obd_connection.disconnect()
+            except Exception as e:
+                print(f"[OBD] Disconnect error: {e}")
+            self.obd_connection = None
+
+        self.obd_connected = False
+        self.obd_connecting = False
+        self.obd_state = "disconnected"
+        self.obd_state_msg = ""
+
     def _simulate_boost(self, t):
         """Simulate boost pressure changes."""
         # Simulate WOT pull: vacuum -> peak boost -> slight drop
@@ -1377,6 +1660,22 @@ class BoostGaugeTest:
         self._running = True
         signal.signal(signal.SIGINT, self._exit)
 
+        # Auto-connect to simulator if enabled
+        try:
+            import json
+            import os
+            settings_path = os.path.join(os.path.dirname(__file__), "config", "settings.json")
+            if os.path.exists(settings_path):
+                with open(settings_path) as f:
+                    settings = json.load(f)
+                sim_config = settings.get("simulator", {})
+                if sim_config.get("enabled") and sim_config.get("address"):
+                    sim_addr = sim_config["address"]
+                    print(f"[OBD] Auto-connecting to simulator at {sim_addr}...")
+                    self._start_obd_connection_async(sim_addr)
+        except Exception as e:
+            print(f"[OBD] Could not load simulator config: {e}")
+
         start_time = time.time()
         last_frame_time = start_time
         last_obd_time = start_time
@@ -1400,24 +1699,31 @@ class BoostGaugeTest:
                         self._running = False
                         break
 
-            # Simulate OBD2 data arriving at lower rate
+            # OBD data update:
+            # - If OBD connected: data arrives via _obd_data_callback (threaded)
+            # - If demo_mode: simulate data here
+            # - Otherwise: hold current values
             if current_time - last_obd_time >= obd_interval:
                 t = current_time - start_time
-                self.boost_target = self._simulate_boost(t)
-                # Simulate other gauges
-                self.coolant_target = 180 + math.sin(t * 0.5) * 20  # 160-200°F
-                self.engine_load_target = 30 + math.sin(t * 2) * 25 + (20 if self.boost_target > 5 else 0)
-                last_obd_time = current_time
 
-                # Update all simulated values for live preview in settings
-                self.simulated_values['BOOST'] = self.boost_target
-                self.simulated_values['COOLANT_TEMP'] = self.coolant_target
-                self.simulated_values['ENGINE_LOAD'] = self.engine_load_target
-                self.simulated_values['INTAKE_TEMP'] = 70 + math.sin(t * 0.3) * 30  # 40-100°F
-                self.simulated_values['RPM'] = 2000 + math.sin(t * 1.5) * 1500 + (2000 if self.boost_target > 5 else 0)
-                self.simulated_values['THROTTLE_POS'] = max(5, min(100, 15 + self.boost_target * 3))
-                self.simulated_values['OIL_TEMP'] = 200 + math.sin(t * 0.2) * 30
-                self.simulated_values['FUEL_PRESSURE'] = 40 + math.sin(t * 0.8) * 15
+                if self.demo_mode and not self.obd_connected:
+                    # Demo mode: simulate boost/temp/load animation
+                    self.boost_target = self._simulate_boost(t)
+                    self.coolant_target = 180 + math.sin(t * 0.5) * 20  # 160-200°F
+                    self.engine_load_target = 30 + math.sin(t * 2) * 25 + (20 if self.boost_target > 5 else 0)
+
+                    # Update all simulated values for live preview in settings
+                    self.simulated_values['BOOST'] = self.boost_target
+                    self.simulated_values['COOLANT_TEMP'] = self.coolant_target
+                    self.simulated_values['ENGINE_LOAD'] = self.engine_load_target
+                    self.simulated_values['INTAKE_TEMP'] = 70 + math.sin(t * 0.3) * 30  # 40-100°F
+                    self.simulated_values['RPM'] = 2000 + math.sin(t * 1.5) * 1500 + (2000 if self.boost_target > 5 else 0)
+                    self.simulated_values['THROTTLE_POS'] = max(5, min(100, 15 + self.boost_target * 3))
+                    self.simulated_values['OIL_TEMP'] = 200 + math.sin(t * 0.2) * 30
+                    self.simulated_values['FUEL_PRESSURE'] = 40 + math.sin(t * 0.8) * 15
+                # When OBD connected, data arrives via _obd_data_callback
+
+                last_obd_time = current_time
 
             # Smoothly tween all gauges toward target
             self._update_value('boost_psi', self.boost_target, dt)
@@ -1441,6 +1747,9 @@ class BoostGaugeTest:
                 elif self.screen_col == 2:
                     # Engine load gauge
                     self._draw_load_gauge(self.engine_load)
+                elif self.screen_col == 3:
+                    # Shift light (full-screen peripheral vision indicator)
+                    self._draw_shift_light_screen()
             elif self.screen_row == 1:
                 # Row 1: Settings screens
                 if self.screen_col == 0:
@@ -1469,6 +1778,11 @@ class BoostGaugeTest:
 
             # Frame rate limiting
             self._clock.tick(target_fps)
+
+        # Cleanup OBD connection
+        if self.obd_connection:
+            print("Disconnecting OBD...")
+            self.disconnect_obd_socket()
 
         # Final stats
         total_time = time.time() - start_time

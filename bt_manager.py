@@ -2,14 +2,27 @@
 Bluetooth Management for OBD-Gauge
 
 Handles scanning, pairing, and connecting to OBD2 adapters like OBDLink MX+.
-Uses bluetoothctl and rfcomm for SPP (Serial Port Profile) connections.
+
+Supports two connection modes:
+1. rfcomm device files (legacy) - uses shell commands, can be fragile
+2. Direct Bluetooth sockets (preferred) - uses PyBluez, more reliable
 """
 
 import subprocess
 import re
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
+
+# Import OBDSocket for socket-based connections
+try:
+    from obd_socket import OBDSocket, ConnectionState, OBDData
+    HAS_OBD_SOCKET = True
+except ImportError:
+    HAS_OBD_SOCKET = False
+    OBDSocket = None
+    ConnectionState = None
+    OBDData = None
 
 
 @dataclass
@@ -267,6 +280,74 @@ def enable_bluetooth() -> bool:
         return True
     except Exception:
         return False
+
+
+# =============================================================================
+# Socket-based OBD Connection (Preferred Method)
+# =============================================================================
+
+def connect_obd_socket(mac: str, channel: int = 1) -> Optional['OBDSocket']:
+    """
+    Connect to OBD adapter using direct Bluetooth socket.
+
+    This is the preferred method - more reliable than rfcomm device files.
+
+    Args:
+        mac: Device MAC address (e.g., "AA:BB:CC:DD:EE:FF")
+        channel: RFCOMM channel (usually 1 for OBD adapters)
+
+    Returns:
+        Connected OBDSocket instance or None if failed
+    """
+    if not HAS_OBD_SOCKET:
+        print("Error: obd_socket module not available")
+        return None
+
+    try:
+        obd = OBDSocket(mac, channel)
+        if obd.connect():
+            return obd
+        else:
+            return None
+    except Exception as e:
+        print(f"Socket connection error: {e}")
+        return None
+
+
+def create_obd_connection(mac: str, channel: int = 1,
+                          state_callback=None,
+                          data_callback=None) -> Optional['OBDSocket']:
+    """
+    Create OBDSocket with callbacks for UI integration.
+
+    Args:
+        mac: Device MAC address
+        channel: RFCOMM channel
+        state_callback: Called on state changes - callback(state, message)
+        data_callback: Called with new data - callback(OBDData)
+
+    Returns:
+        OBDSocket instance (not yet connected) or None
+    """
+    if not HAS_OBD_SOCKET:
+        print("Error: obd_socket module not available")
+        return None
+
+    try:
+        obd = OBDSocket(mac, channel)
+        if state_callback:
+            obd.set_state_callback(state_callback)
+        if data_callback:
+            obd.set_data_callback(data_callback)
+        return obd
+    except Exception as e:
+        print(f"Error creating OBDSocket: {e}")
+        return None
+
+
+def has_socket_support() -> bool:
+    """Check if socket-based OBD connection is available."""
+    return HAS_OBD_SOCKET
 
 
 if __name__ == "__main__":
