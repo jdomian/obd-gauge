@@ -127,6 +127,12 @@ class BoostGaugeTest:
         self._font_small = pygame.font.Font("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 18)
         self._font_tiny = pygame.font.Font("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 14)
 
+        # Load dial background images for hybrid rendering (image bg + procedural overlays)
+        # Must be after pygame.init() but before main loop
+        self._dial_bg_cache = {}
+        self._current_dial_bg = None
+        self._load_dial_backgrounds()
+
         # FPS tracking
         self.frame_count = 0
         self.fps_timer = time.time()
@@ -343,6 +349,48 @@ class BoostGaugeTest:
         else:
             return "load"
 
+    def _load_dial_backgrounds(self):
+        """Load dial background images for hybrid gauge rendering.
+
+        Images are cached at startup for performance. The hybrid approach
+        uses image backgrounds with procedural overlays (needle, readout, labels).
+        """
+        self._dial_bg_cache = {}
+
+        # Map setting names to asset files
+        dial_map = {
+            "audi": "dial_background_audi.png",
+            "audi3": "dial_background_audi3.png",
+            "audi4": "dial_background_audi4.png",
+            "bmw": "dial_background_bmw.png",
+            "dark": "dial_background_dark.png",
+            "minimal": "dial_background_minimal.png",
+            "skoda": "dial_background_skoda.png",
+            "empty": "dial_background_empty.png",
+        }
+
+        base_path = os.path.join(os.path.dirname(__file__), "assets", "dials")
+
+        for name, filename in dial_map.items():
+            path = os.path.join(base_path, filename)
+            if os.path.exists(path):
+                try:
+                    img = pygame.image.load(path).convert_alpha()
+                    # Scale to 480x480 if needed (HyperPixel 2.1 Round display)
+                    if img.get_size() != (480, 480):
+                        img = pygame.transform.smoothscale(img, (480, 480))
+                    self._dial_bg_cache[name] = img
+                    print(f"[Dial] Loaded: {name}")
+                except Exception as e:
+                    print(f"[Dial] Failed to load {name}: {e}")
+
+        # Set current dial background surface
+        self._current_dial_bg = self._dial_bg_cache.get(self.dial_background)
+        if self._current_dial_bg:
+            print(f"[Dial] Active background: {self.dial_background}")
+        else:
+            print(f"[Dial] Using procedural rendering (dial_background={self.dial_background})")
+
     def reload_settings(self):
         """Reload settings from file. Call this when Web UI updates settings.json."""
         print("[Settings] Reloading settings...")
@@ -352,6 +400,10 @@ class BoostGaugeTest:
             pid = gauge["pid"]
             if pid not in self.simulated_values:
                 self.simulated_values[pid] = (gauge["min"] + gauge["max"]) / 2
+        # Update dial background from cache
+        self._current_dial_bg = self._dial_bg_cache.get(self.dial_background)
+        if self._current_dial_bg:
+            print(f"[Settings] Dial background: {self.dial_background}")
         print("[Settings] Reload complete")
 
     def _save_bt_device(self, mac, name):
@@ -1194,7 +1246,13 @@ class BoostGaugeTest:
             gfxdraw.filled_circle(self.screen, row_indicator_x, y, 4, color)
 
     def _draw_generic_gauge(self, value, min_val, max_val, unit, title, color_zones=None):
-        """Draw a generic gauge with customizable range and colors."""
+        """Draw a generic gauge with customizable range and colors.
+
+        Supports hybrid rendering: image background + procedural overlays.
+        When dial_background is set to a valid image (e.g., "audi"), the image
+        provides the face (chrome bezel, carbon fiber, graduations) while the
+        needle, readout, and labels are drawn procedurally for smooth animation.
+        """
         # Default color zones if not specified
         if color_zones is None:
             # Default: blue low, green mid, red high
@@ -1204,42 +1262,53 @@ class BoostGaugeTest:
                 (0.66, 1.0, self.RED),
             ]
 
-        # Outer ring
-        gfxdraw.aacircle(self.screen, 240, 240, 220, self.GRAY)
-        gfxdraw.aacircle(self.screen, 240, 240, 218, self.GRAY)
+        # Check if we're using an image background (hybrid mode)
+        use_image_bg = self._current_dial_bg is not None and self.dial_background != "default"
 
-        # Draw colored arc zones
-        for start_pct, end_pct, color in color_zones:
-            start_a = self.start_angle + (start_pct * self.sweep_angle)
-            end_a = self.start_angle + (end_pct * self.sweep_angle)
-            self._draw_arc(self.center, 190, start_a, end_a, color, 8)
-
-        # Calculate tick interval based on range
-        val_range = max_val - min_val
-        if val_range <= 50:
-            major_step = 5
-        elif val_range <= 200:
-            major_step = 20
-        elif val_range <= 1000:
-            major_step = 100
+        if use_image_bg:
+            # HYBRID MODE: Blit dial background image first
+            # Image provides: chrome bezel, carbon fiber texture, graduations, numbers
+            self.screen.blit(self._current_dial_bg, (0, 0))
         else:
-            major_step = 1000
+            # PROCEDURAL MODE: Draw face elements manually
+            # Outer ring
+            gfxdraw.aacircle(self.screen, 240, 240, 220, self.GRAY)
+            gfxdraw.aacircle(self.screen, 240, 240, 218, self.GRAY)
 
-        # Tick marks and labels
-        for val in range(int(min_val), int(max_val) + 1, major_step):
-            val_normalized = (val - min_val) / (max_val - min_val)
-            angle = self.start_angle + (val_normalized * self.sweep_angle)
+            # Draw colored arc zones
+            for start_pct, end_pct, color in color_zones:
+                start_a = self.start_angle + (start_pct * self.sweep_angle)
+                end_a = self.start_angle + (end_pct * self.sweep_angle)
+                self._draw_arc(self.center, 190, start_a, end_a, color, 8)
 
-            # Major tick
-            inner = self._get_point(self.center, angle, 165)
-            outer = self._get_point(self.center, angle, 185)
-            pygame.draw.line(self.screen, self.WHITE, inner, outer, 3)
+            # Calculate tick interval based on range
+            val_range = max_val - min_val
+            if val_range <= 50:
+                major_step = 5
+            elif val_range <= 200:
+                major_step = 20
+            elif val_range <= 1000:
+                major_step = 100
+            else:
+                major_step = 1000
 
-            # Label
-            label_pos = self._get_point(self.center, angle, 140)
-            label = self._font_small.render(str(val), True, self.WHITE)
-            label_rect = label.get_rect(center=label_pos)
-            self.screen.blit(label, label_rect)
+            # Tick marks and labels
+            for val in range(int(min_val), int(max_val) + 1, major_step):
+                val_normalized = (val - min_val) / (max_val - min_val)
+                angle = self.start_angle + (val_normalized * self.sweep_angle)
+
+                # Major tick
+                inner = self._get_point(self.center, angle, 165)
+                outer = self._get_point(self.center, angle, 185)
+                pygame.draw.line(self.screen, self.WHITE, inner, outer, 3)
+
+                # Label
+                label_pos = self._get_point(self.center, angle, 140)
+                label = self._font_small.render(str(val), True, self.WHITE)
+                label_rect = label.get_rect(center=label_pos)
+                self.screen.blit(label, label_rect)
+
+        # === PROCEDURAL OVERLAYS (drawn on both modes) ===
 
         # Draw needle
         val_normalized = max(0, min(1, (value - min_val) / (max_val - min_val)))
