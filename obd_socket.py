@@ -73,7 +73,7 @@ class OBDSocket:
         ("ATL0", 0.5),     # Linefeeds off
         ("ATS0", 0.5),     # Spaces off (compact responses)
         ("ATH0", 0.5),     # Headers off
-        ("ATSP0", 0.5),    # Auto-detect protocol
+        ("ATSP6", 1.0),    # Force CAN 500 protocol (RS7)
     ]
 
     # OBD-II PID definitions (Mode 01)
@@ -168,7 +168,7 @@ class OBDSocket:
             self.socket.connect((self.tcp_host, self.tcp_port))
 
             # Set shorter timeout for commands
-            self.socket.settimeout(2.0)
+            self.socket.settimeout(0.5)
 
             # Read initial prompt
             try:
@@ -194,30 +194,25 @@ class OBDSocket:
             return False
 
     def _connect_bluetooth(self) -> bool:
-        """Connect via Bluetooth RFCOMM socket"""
-        if not HAS_BLUETOOTH:
-            error_msg = "Bluetooth not available (PyBluez not installed)"
-            logger.error(error_msg)
-            self._set_state(ConnectionState.ERROR, error_msg)
-            return False
-
+        """Connect via Bluetooth RFCOMM socket using native Python socket"""
         self._set_state(ConnectionState.CONNECTING, f"Connecting to {self.mac_address}")
 
         try:
-            # Create RFCOMM socket
-            self.socket = bluetooth.BluetoothSocket(bluetooth.RFCOMM)
+            # Use native Python socket instead of PyBluez (fixes Error 77)
+            # AF_BLUETOOTH = 31, BTPROTO_RFCOMM = 3
+            self.socket = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_STREAM, socket.BTPROTO_RFCOMM)
             self.socket.settimeout(10.0)  # 10 second connection timeout
 
             logger.info(f"Connecting to {self.mac_address} channel {self.channel}")
             self.socket.connect((self.mac_address, self.channel))
 
             # Set shorter timeout for commands
-            self.socket.settimeout(2.0)
+            self.socket.settimeout(0.5)
 
             logger.info("Socket connected, initializing ELM327...")
             return self._initialize()
 
-        except bluetooth.btcommon.BluetoothError as e:
+        except OSError as e:
             error_msg = f"Bluetooth error: {e}"
             logger.error(error_msg)
             self._set_state(ConnectionState.ERROR, error_msg)
@@ -293,11 +288,11 @@ class OBDSocket:
                         break
                 except:
                     break
-            self.socket.settimeout(2.0)
+            self.socket.settimeout(0.5)
         except:
             pass
 
-    def _send_command(self, cmd: str, timeout: float = 1.0) -> Optional[str]:
+    def _send_command(self, cmd: str, timeout: float = 0.5) -> Optional[str]:
         """
         Send command to ELM327 and read response.
 
@@ -345,7 +340,7 @@ class OBDSocket:
             logger.error(f"Command error ({cmd}): {e}")
             return None
 
-    def query_pid(self, pid: str) -> Optional[Any]:
+    def query_pid(self, pid: str, fast: bool = False) -> Optional[Any]:
         """
         Query a single OBD-II PID and return parsed value.
 
@@ -358,7 +353,7 @@ class OBDSocket:
         if self.state != ConnectionState.CONNECTED:
             return None
 
-        response = self._send_command(pid)
+        response = self._send_command(pid, timeout=0.3 if fast else 0.5)
         if not response:
             return None
 
@@ -462,6 +457,40 @@ class OBDSocket:
         self.data.timestamp = time.time()
         return self.data
 
+
+    def query_fast(self) -> OBDData:
+        """Query single PIDs with throttle prioritized for responsiveness.
+        
+        Pattern: Throttle -> Throttle -> MAP -> Throttle -> Throttle -> RPM
+        This gives throttle 4x more updates than boost/RPM.
+        """
+        # Prioritize throttle: T T M T T R (throttle gets 4/6 = 67% of queries)
+        pids = [
+            ('0111', 'throttle_pos'),  # Throttle
+            ('0111', 'throttle_pos'),  # Throttle again
+            ('010B', 'map_kpa'),        # MAP for boost
+            ('0111', 'throttle_pos'),  # Throttle
+            ('0111', 'throttle_pos'),  # Throttle again  
+            ('010C', 'rpm'),            # RPM
+        ]
+        
+        # Rotate through PIDs
+        self._fast_pid_idx = getattr(self, '_fast_pid_idx', 0)
+        pid_code, attr = pids[self._fast_pid_idx]
+        self._fast_pid_idx = (self._fast_pid_idx + 1) % len(pids)
+        
+        result = self.query_pid(pid_code, fast=True)
+        if result is not None:
+            if attr == 'throttle_pos':
+                self.data.throttle_pos = result
+            elif attr == 'map_kpa':
+                self.data.map_kpa = result
+                boost_kpa = result - 101.325
+                self.data.boost_psi = boost_kpa * 0.145038
+            elif attr == 'rpm':
+                self.data.rpm = result
+        
+        return self.data
     def start_polling(self, rate_hz: float = 10.0):
         """
         Start background thread to continuously poll OBD data.
@@ -496,7 +525,12 @@ class OBDSocket:
             start = time.time()
 
             try:
-                data = self.query_all()
+                # Fast polling: query essential PIDs every cycle, full query rarely
+                self._poll_count = getattr(self, "_poll_count", 0) + 1
+                if self._poll_count % 100 == 0:
+                    data = self.query_all()  # Full query for coolant, speed, IAT (every ~10 sec)
+                else:
+                    data = self.query_fast()  # Fast query for boost, RPM, throttle
                 error_count = 0  # Reset on success
 
                 if self.data_callback:
@@ -638,3 +672,4 @@ if __name__ == "__main__":
 
     obd.disconnect()
     print("Done")
+

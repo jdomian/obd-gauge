@@ -24,6 +24,7 @@ import math
 import time
 import json
 import threading
+import subprocess
 from touch import TouchHandler, GestureType
 
 # Import our new modules
@@ -81,7 +82,27 @@ class BoostGaugeTest:
         self.BLUE = (0, 150, 255)
         self.GOLD = (255, 215, 0)
 
-        # Gauge settings
+        # Audi MMI Color Palette
+        self.AUDI_BLACK = (10, 10, 10)
+        self.AUDI_DARK = (26, 26, 26)
+        self.AUDI_CHARCOAL = (37, 37, 37)
+        self.AUDI_RED = (187, 10, 30)
+        self.AUDI_RED_LIGHT = (204, 26, 46)
+        self.AUDI_RED_DIM = (100, 5, 15)
+        self.AUDI_WHITE = (255, 255, 255)
+        self.AUDI_GRAY = (160, 160, 160)
+        self.AUDI_GRAY_MUTED = (96, 96, 96)
+        self.AUDI_GREEN = (0, 200, 83)
+        self.AUDI_AMBER = (255, 179, 0)
+        self.AUDI_DIVIDER = (51, 51, 51)
+
+        # Settings file path
+        self._settings_path = os.path.join(os.path.dirname(__file__), "config", "settings.json")
+
+        # Load settings from config file (gauges, display, etc.)
+        self._load_settings()
+
+        # Gauge settings (fallback/defaults, overridden by settings.json)
         self.min_psi = -15  # Vacuum
         self.max_psi = 25   # Boost
         self.current_psi = -10.0  # Displayed value (smoothed)
@@ -111,14 +132,15 @@ class BoostGaugeTest:
         self.fps_timer = time.time()
         self.fps = 0
 
-        # 2D Screen grid navigation
-        # Row 0: Gauges (boost, temp, engine load, SHIFT LIGHT) - 4 columns
-        # Row 1: QR Settings (col 0), Bluetooth (col 1) - 2 columns
-        # Row 2: Brightness slider - 1 column
+        # 2D Screen grid navigation (vertical swipe down to access settings)
+        # Row 0: Gauges (boost, temp, engine load, SHIFT LIGHT) - 4+ columns
+        # Row 1: Bluetooth - 1 column
+        # Row 2: WiFi/Settings/QR - 1 column (shows connection status, SSID, IP)
+        # Row 3: System (Brightness/Reboot/Restart) - 1 column
         self.screen_col = 0  # Current column
         self.screen_row = 0  # Current row
-        self.row_cols = [4, 2, 1]  # Number of columns per row (4th column = shift light)
-        self.num_rows = 3    # 3 rows (gauges + settings/BT + brightness)
+        self.row_cols = [4, 1, 1, 1]  # Number of columns per row
+        self.num_rows = 4    # 4 rows (gauges + bluetooth + wifi/settings + system)
 
         # Brightness setting (10-100%)
         self.brightness = 100
@@ -154,6 +176,10 @@ class BoostGaugeTest:
         self.obd_state_msg = ""
         self.obd_connected = False
         self.obd_connecting = False
+        self.obd_connecting_mac = None  # MAC of device being connected
+        self.obd_connecting_name = None  # Name of device being connected
+        self.obd_connected_address = None  # Address/MAC of connected device (persists after connect)
+        self.obd_connected_name = None     # Name of connected device (e.g., "Simulator", "OBDLink MX+")
 
         # Pending system action (reboot/shutdown) - executed after clean exit
         self._pending_action = None  # 'reboot' or 'shutdown'
@@ -241,6 +267,121 @@ class BoostGaugeTest:
         # See end of file for touch setup
         print("Touch will be initialized at module level")
 
+    def _load_settings(self):
+        """Load gauge and display settings from settings.json.
+
+        This is called at startup and can be called again to reload settings
+        (e.g., after Web UI makes changes).
+        """
+        # Default gauge configurations (used if settings.json is missing or incomplete)
+        self.gauge_configs = [
+            {"position": 0, "pid": "BOOST", "label": "BOOST", "min": -15, "max": 25, "conversion": "none", "color_preset": "boost"},
+            {"position": 1, "pid": "COOLANT_TEMP", "label": "COOLANT", "min": 100, "max": 260, "conversion": "c_to_f", "color_preset": "temp"},
+            {"position": 2, "pid": "ENGINE_LOAD", "label": "LOAD", "min": 0, "max": 100, "conversion": "none", "color_preset": "load"},
+        ]
+
+        # Display settings defaults
+        self.target_fps = 30
+        self.demo_mode = True
+        self.dial_background = "default"
+
+        try:
+            if os.path.exists(self._settings_path):
+                with open(self._settings_path) as f:
+                    settings = json.load(f)
+
+                # Load gauge configurations
+                if "gauges" in settings and isinstance(settings["gauges"], list):
+                    loaded_gauges = []
+                    for g in settings["gauges"]:
+                        gauge_config = {
+                            "position": g.get("position", len(loaded_gauges)),
+                            "pid": g.get("pid", "BOOST"),
+                            "label": g.get("label", g.get("pid", "GAUGE")),
+                            "min": g.get("min", 0),
+                            "max": g.get("max", 100),
+                            "conversion": g.get("conversion", "none"),
+                            "color_preset": g.get("color_preset", self._get_color_preset_for_pid(g.get("pid", ""))),
+                            "needle": g.get("needle", "default"),
+                        }
+                        loaded_gauges.append(gauge_config)
+
+                    if loaded_gauges:
+                        # Sort by position
+                        self.gauge_configs = sorted(loaded_gauges, key=lambda x: x["position"])
+                        print(f"[Settings] Loaded {len(self.gauge_configs)} gauge configs")
+
+                # Load display settings
+                display = settings.get("display", {})
+                self.target_fps = display.get("fps", 30)
+                self.smoothing = display.get("smoothing", 0.25)
+                self.demo_mode = display.get("demo_mode", True)
+                self.dial_background = display.get("dial_background", "default")
+
+                print(f"[Settings] Display: fps={self.target_fps}, demo={self.demo_mode}, dial={self.dial_background}")
+
+                # Update row_cols based on number of gauges (+ shift light)
+                # Row 0: Gauges (+ shift light), Row 1: Bluetooth, Row 2: WiFi/Settings, Row 3: System
+                num_gauges = len(self.gauge_configs)
+                self.row_cols = [num_gauges + 1, 1, 1, 1]  # 4 rows now
+
+        except Exception as e:
+            print(f"[Settings] Failed to load settings: {e}")
+            # Keep defaults on error
+
+    def _get_color_preset_for_pid(self, pid):
+        """Get default color preset based on PID type."""
+        pid_upper = pid.upper()
+        if "TEMP" in pid_upper or "OIL" in pid_upper:
+            return "temp"
+        elif "BOOST" in pid_upper:
+            return "boost"
+        elif "RPM" in pid_upper:
+            return "rpm"
+        elif "FUEL" in pid_upper:
+            return "fuel"
+        else:
+            return "load"
+
+    def reload_settings(self):
+        """Reload settings from file. Call this when Web UI updates settings.json."""
+        print("[Settings] Reloading settings...")
+        self._load_settings()
+        # Re-initialize simulated values for any new PIDs
+        for gauge in self.gauge_configs:
+            pid = gauge["pid"]
+            if pid not in self.simulated_values:
+                self.simulated_values[pid] = (gauge["min"] + gauge["max"]) / 2
+        print("[Settings] Reload complete")
+
+    def _save_bt_device(self, mac, name):
+        """Save Bluetooth device to settings for auto-connect on next startup."""
+        try:
+            settings_path = os.path.join(os.path.dirname(__file__), "config", "settings.json")
+            if os.path.exists(settings_path):
+                with open(settings_path) as f:
+                    settings = json.load(f)
+
+                # Update OBD settings with the device
+                if "obd" not in settings:
+                    settings["obd"] = {}
+                settings["obd"]["bt_device_mac"] = mac
+                settings["obd"]["bt_device_name"] = name or "OBD Device"
+
+                # Disable demo mode since we have a real device
+                if "display" in settings:
+                    settings["display"]["demo_mode"] = False
+
+                # Disable simulator since we're using real BT
+                if "simulator" in settings:
+                    settings["simulator"]["enabled"] = False
+
+                with open(settings_path, 'w') as f:
+                    json.dump(settings, f, indent=2)
+                print(f"[Settings] Saved BT device: {name} ({mac})")
+        except Exception as e:
+            print(f"[Settings] Failed to save BT device: {e}")
+
     def _generate_qr_code(self):
         """Generate single QR code for WiFi auto-connect."""
         if not QR_AVAILABLE:
@@ -293,6 +434,193 @@ class BoostGaugeTest:
             gfxdraw.aacircle(self.screen, x + w - radius, y + radius, radius, color)
             pygame.draw.line(self.screen, color, (x + radius, y), (x + w - radius, y), outline_width)
             pygame.draw.line(self.screen, color, (x + radius, y + h - 1), (x + w - radius, y + h - 1), outline_width)
+
+    # ============= Audi MMI UI Helper Functions =============
+
+    def _draw_audi_header(self, text, y=55):
+        """Draw Audi MMI style header with red underline accent."""
+        # Header text in white
+        title = self._font_medium.render(text, True, self.AUDI_WHITE)
+        title_rect = title.get_rect(center=(240, y))
+        self.screen.blit(title, title_rect)
+        # Red underline accent
+        underline_width = title_rect.width + 20
+        underline_x = 240 - underline_width // 2
+        pygame.draw.line(self.screen, self.AUDI_RED, (underline_x, y + 18), (underline_x + underline_width, y + 18), 2)
+
+    def _draw_audi_button(self, text, rect, active=False, pressed=False, color_scheme="default"):
+        """Draw Audi MMI style button.
+
+        Args:
+            text: Button label
+            rect: pygame.Rect for button bounds
+            active: If True, button has brighter styling
+            pressed: If True, button is being pressed
+            color_scheme: "default", "red", "green", or "blue"
+        """
+        # Color schemes
+        schemes = {
+            "default": {"bg": self.AUDI_CHARCOAL, "border": self.AUDI_GRAY, "active_bg": self.AUDI_DARK, "active_border": self.AUDI_RED},
+            "red": {"bg": (60, 20, 20), "border": self.AUDI_RED_DIM, "active_bg": (80, 30, 30), "active_border": self.AUDI_RED},
+            "green": {"bg": (20, 50, 30), "border": (0, 100, 40), "active_bg": (30, 70, 40), "active_border": self.AUDI_GREEN},
+            "blue": {"bg": (20, 35, 55), "border": (0, 80, 140), "active_bg": (30, 50, 75), "active_border": self.BLUE},
+        }
+        scheme = schemes.get(color_scheme, schemes["default"])
+
+        if pressed:
+            bg_color = self.AUDI_RED
+            border_color = self.AUDI_RED_LIGHT
+        elif active:
+            bg_color = scheme["active_bg"]
+            border_color = scheme["active_border"]
+        else:
+            bg_color = scheme["bg"]
+            border_color = scheme["border"]
+
+        # Draw button background
+        pygame.draw.rect(self.screen, bg_color, rect)
+        pygame.draw.rect(self.screen, border_color, rect, 2)
+
+        # Draw text
+        text_color = self.AUDI_WHITE if active or pressed else self.AUDI_GRAY
+        btn_text = self._font_small.render(text, True, text_color)
+        btn_rect = btn_text.get_rect(center=rect.center)
+        self.screen.blit(btn_text, btn_rect)
+
+    def _draw_audi_list_item(self, y, name, subtitle=None, selected=False, connected=False, paired=False):
+        """Draw Audi MMI style list item row.
+
+        Args:
+            y: Y position for the item
+            name: Main text
+            subtitle: Secondary text (e.g., MAC address)
+            selected: If True, item is highlighted
+            connected: If True, show green indicator
+            paired: If True, show "PAIRED" label
+        """
+        item_height = 50
+
+        # Selection background
+        if selected:
+            # Red left accent bar
+            pygame.draw.rect(self.screen, self.AUDI_RED, (75, y - 2, 4, item_height - 4))
+            # Subtle red tint background
+            pygame.draw.rect(self.screen, (40, 15, 15), (80, y - 2, 320, item_height - 4))
+            name_color = self.AUDI_WHITE
+            subtitle_color = self.AUDI_GRAY
+        else:
+            name_color = self.AUDI_GRAY
+            subtitle_color = self.AUDI_GRAY_MUTED
+
+        # Connection status indicator
+        if connected:
+            indicator_color = self.AUDI_GREEN
+        elif paired:
+            indicator_color = self.AUDI_AMBER
+        else:
+            indicator_color = self.AUDI_GRAY_MUTED
+        gfxdraw.aacircle(self.screen, 100, y + 18, 6, indicator_color)
+        gfxdraw.filled_circle(self.screen, 100, y + 18, 6, indicator_color)
+
+        # Name text
+        name_surface = self._font_small.render(name[:22], True, name_color)
+        self.screen.blit(name_surface, (115, y))
+
+        # Subtitle (MAC address)
+        if subtitle:
+            sub_surface = self._font_tiny.render(subtitle, True, subtitle_color)
+            self.screen.blit(sub_surface, (115, y + 22))
+
+        # Paired label on right
+        if paired and not connected:
+            paired_surface = self._font_tiny.render("PAIRED", True, self.AUDI_AMBER)
+            self.screen.blit(paired_surface, (355, y + 8))
+        elif connected:
+            conn_surface = self._font_tiny.render("CONNECTED", True, self.AUDI_GREEN)
+            self.screen.blit(conn_surface, (340, y + 8))
+
+        # Divider line
+        pygame.draw.line(self.screen, self.AUDI_DIVIDER, (85, y + item_height - 5), (395, y + item_height - 5), 1)
+
+    def _draw_audi_screen_background(self):
+        """Draw the standard Audi MMI dark background for settings screens."""
+        gfxdraw.filled_circle(self.screen, 240, 240, 220, self.AUDI_BLACK)
+        gfxdraw.aacircle(self.screen, 240, 240, 220, self.AUDI_CHARCOAL)
+
+    def _draw_audi_nav_hints(self, hints):
+        """Draw navigation hints at bottom of screen.
+
+        Args:
+            hints: List of strings like ["↓ gauges", "← bluetooth"] or single string
+        """
+        # Handle both list and string input
+        if isinstance(hints, list):
+            hint_text = "   ".join(hints)
+        else:
+            hint_text = hints
+        hint_surface = self._font_tiny.render(hint_text, True, self.AUDI_GRAY_MUTED)
+        hint_rect = hint_surface.get_rect(center=(240, 450))
+        self.screen.blit(hint_surface, hint_rect)
+
+    # ============= End Audi MMI Helpers =============
+
+    def _get_wifi_info(self):
+        """Get current WiFi connection info (non-blocking, background thread updates).
+
+        Returns:
+            dict: {connected: bool, ssid: str, ip: str}
+        """
+        # Initialize cache if not exists
+        if not hasattr(self, '_wifi_info_cache'):
+            self._wifi_info_cache = {"connected": False, "ssid": "", "ip": ""}
+            self._wifi_info_time = 0
+            self._wifi_info_updating = False
+
+        # Start background update if needed (non-blocking)
+        now = time.time()
+        if not self._wifi_info_updating and (now - self._wifi_info_time > 5):
+            self._wifi_info_updating = True
+            thread = threading.Thread(target=self._update_wifi_info_background, daemon=True)
+            thread.start()
+
+        return self._wifi_info_cache
+
+    def _update_wifi_info_background(self):
+        """Background thread to update WiFi info without blocking UI."""
+        info = {"connected": False, "ssid": "", "ip": ""}
+
+        try:
+            # Get SSID using iwgetid
+            result = subprocess.run(
+                ["iwgetid", "-r"],
+                capture_output=True,
+                text=True,
+                timeout=2
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                info["ssid"] = result.stdout.strip()
+                info["connected"] = True
+
+            # Get IP address for wlan0
+            if info["connected"]:
+                result = subprocess.run(
+                    ["hostname", "-I"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    # Get first IP (usually the wlan0 IP)
+                    ips = result.stdout.strip().split()
+                    if ips:
+                        info["ip"] = ips[0]
+        except Exception as e:
+            print(f"Error getting WiFi info: {e}")
+
+        # Update cache
+        self._wifi_info_cache = info
+        self._wifi_info_time = time.time()
+        self._wifi_info_updating = False
 
     def _on_enter_qr_screen(self):
         """Called when entering the QR settings screen."""
@@ -403,6 +731,11 @@ class BoostGaugeTest:
         """Start Bluetooth device scan in background thread."""
         if self.bt_scanning:
             return
+
+        # Auto-disable demo mode when scanning for real devices
+        if self.demo_mode:
+            self.demo_mode = False
+            print("Demo mode auto-disabled for BT scan")
 
         def scan_thread():
             self.bt_scanning = True
@@ -564,21 +897,39 @@ class BoostGaugeTest:
                     print("Tap -> Stopping hotspot...")
                     self._stop_hotspot_async()
         elif self.screen_row == 1 and self.screen_col == 1:
-            # Bluetooth screen - tap zones for SCAN and PAIR
-            if y > 350:
-                # Bottom area - buttons
+            # Bluetooth screen - tap zones for SCAN and PAIR/DISCONNECT
+            # Reset disconnect confirm if tapping elsewhere
+            if y <= 310 or x < 240:
+                self.disconnect_confirm = False
+
+            if y > 310:
+                # Bottom area - buttons (moved up from 350)
                 if x < 240:
-                    # Left side - SCAN
-                    print("Tap -> Starting BT scan...")
-                    self._start_bt_scan()
+                    # Left side - SCAN (disabled when connected)
+                    if not self.obd_connected:
+                        print("Tap -> Starting BT scan...")
+                        self._start_bt_scan()
+                    else:
+                        print("Tap -> SCAN disabled while connected")
                 else:
-                    # Right side - PAIR/CONNECT OBD
-                    if self.bt_devices and self.bt_selected_device < len(self.bt_devices):
+                    # Right side - CONNECT or DISCONNECT
+                    if self.obd_connected:
+                        # Already connected - handle disconnect with confirmation
+                        if getattr(self, 'disconnect_confirm', False):
+                            # Second tap - actually disconnect
+                            print("Tap -> DISCONNECT confirmed!")
+                            self.disconnect_confirm = False
+                            self.disconnect_obd_socket()
+                        else:
+                            # First tap - ask for confirmation
+                            print("Tap -> DISCONNECT requested, tap again to confirm")
+                            self.disconnect_confirm = True
+                    elif self.bt_devices and self.bt_selected_device < len(self.bt_devices):
                         device = self.bt_devices[self.bt_selected_device]
                         if not self.obd_connecting:
                             print(f"Tap -> Connecting OBD to {device.name}...")
                             # Start connection in background thread (includes pairing)
-                            self._start_obd_connection_async(device.mac)
+                            self._start_obd_connection_async(device.mac, device.name)
             elif 150 < y < 330 and self.bt_devices:
                 # Device list area - select device
                 # Calculate which device was tapped
@@ -902,15 +1253,15 @@ class BoostGaugeTest:
         pygame.draw.polygon(self.screen, self.RED, [tip, base_left, tail, base_right])
         pygame.draw.polygon(self.screen, self.WHITE, [tip, base_left, tail, base_right], 2)
 
-        # Center hub
-        gfxdraw.aacircle(self.screen, 240, 240, 20, self.GRAY)
-        gfxdraw.filled_circle(self.screen, 240, 240, 20, self.GRAY)
-        gfxdraw.aacircle(self.screen, 240, 240, 10, self.WHITE)
-        gfxdraw.filled_circle(self.screen, 240, 240, 10, self.WHITE)
+        # Center hub - Audi MMI style
+        gfxdraw.aacircle(self.screen, 240, 240, 20, self.AUDI_CHARCOAL)
+        gfxdraw.filled_circle(self.screen, 240, 240, 20, self.AUDI_CHARCOAL)
+        gfxdraw.aacircle(self.screen, 240, 240, 10, self.AUDI_RED)
+        gfxdraw.filled_circle(self.screen, 240, 240, 10, self.AUDI_RED)
 
-        # Digital readout
-        pygame.draw.rect(self.screen, self.GRAY, (170, 300, 140, 60))
-        pygame.draw.rect(self.screen, self.WHITE, (170, 300, 140, 60), 2)
+        # Digital readout - Audi MMI style
+        pygame.draw.rect(self.screen, self.AUDI_CHARCOAL, (170, 300, 140, 60))
+        pygame.draw.rect(self.screen, self.AUDI_DIVIDER, (170, 300, 140, 60), 2)
 
         # Determine color based on position in range
         val_pct = (value - min_val) / (max_val - min_val)
@@ -925,12 +1276,12 @@ class BoostGaugeTest:
         val_rect = val_surface.get_rect(center=(240, 330))
         self.screen.blit(val_surface, val_rect)
 
-        # Unit and title
-        unit_surface = self._font_small.render(unit, True, self.WHITE)
+        # Unit and title - Audi MMI style
+        unit_surface = self._font_small.render(unit, True, self.AUDI_GRAY)
         unit_rect = unit_surface.get_rect(center=(240, 375))
         self.screen.blit(unit_surface, unit_rect)
 
-        title_surface = self._font_small.render(title, True, self.WHITE)
+        title_surface = self._font_small.render(title, True, self.AUDI_WHITE)
         title_rect = title_surface.get_rect(center=(240, 60))
         self.screen.blit(title_surface, title_rect)
 
@@ -953,6 +1304,60 @@ class BoostGaugeTest:
             (0.7, 1.0, self.RED),     # Heavy: 70-100%
         ]
         self._draw_generic_gauge(load, 0, 100, "%", "ENGINE LOAD", color_zones)
+
+    def _draw_configured_gauge(self, gauge_config):
+        """Draw a gauge based on configuration from settings.json.
+
+        Args:
+            gauge_config: Dict with keys: pid, label, min, max, conversion, color_preset
+        """
+        pid = gauge_config.get("pid", "BOOST")
+        label = gauge_config.get("label", pid)
+        min_val = gauge_config.get("min", 0)
+        max_val = gauge_config.get("max", 100)
+        conversion = gauge_config.get("conversion", "none")
+        color_preset = gauge_config.get("color_preset", "load")
+
+        # Get current value from simulated_values (updated by demo mode or OBD)
+        raw_value = self.simulated_values.get(pid, (min_val + max_val) / 2)
+
+        # Apply conversion if needed
+        if conversion == "c_to_f":
+            # Celsius to Fahrenheit
+            value = raw_value * 9/5 + 32
+        elif conversion == "kpa_to_psi":
+            # kPa to PSI (for boost)
+            value = raw_value * 0.145038
+        elif conversion == "bar_to_psi":
+            # Bar to PSI
+            value = raw_value * 14.5038
+        else:
+            value = raw_value
+
+        # Get color zones from preset
+        color_zones = self.color_zone_presets.get(color_preset, self.color_zone_presets['load'])
+
+        # Determine unit based on PID or config
+        unit = self._get_unit_for_pid(pid, conversion)
+
+        # Draw the gauge
+        self._draw_generic_gauge(value, min_val, max_val, unit, label, color_zones)
+
+    def _get_unit_for_pid(self, pid, conversion="none"):
+        """Get display unit for a PID."""
+        pid_upper = pid.upper()
+        if "TEMP" in pid_upper:
+            return "°F" if conversion == "c_to_f" else "°C"
+        elif "BOOST" in pid_upper or "PRESSURE" in pid_upper:
+            return "PSI"
+        elif "RPM" in pid_upper:
+            return "RPM"
+        elif "THROTTLE" in pid_upper or "LOAD" in pid_upper:
+            return "%"
+        elif "SPEED" in pid_upper:
+            return "MPH"
+        else:
+            return ""
 
     def _draw_shift_light_screen(self):
         """Draw full-screen shift light for peripheral vision.
@@ -1076,142 +1481,182 @@ class BoostGaugeTest:
         self.screen.blit(val_surface, val_rect)
 
     def _draw_qr_settings_screen(self):
-        """Draw the QR code settings screen."""
-        # Dark background
-        gfxdraw.filled_circle(self.screen, 240, 240, 220, self.DARK_GRAY)
-        gfxdraw.aacircle(self.screen, 240, 240, 220, self.GRAY)
+        """Draw the WiFi/Settings screen - Audi MMI style.
 
-        # Title
-        title = self._font_medium.render("SETTINGS", True, self.GOLD)
-        title_rect = title.get_rect(center=(240, 55))
-        self.screen.blit(title, title_rect)
+        Shows current WiFi connection status at top, then hotspot controls below.
+        """
+        # Audi MMI dark background
+        self._draw_audi_screen_background()
+
+        # Audi MMI header with red underline
+        self._draw_audi_header("WIFI / SETTINGS")
+
+        # Get current WiFi info
+        wifi_info = self._get_wifi_info()
+
+        # === WiFi Status Section (top) ===
+        wifi_y = 95  # Starting Y position
+
+        # WiFi connection status indicator
+        if wifi_info["connected"]:
+            # Connected - show green with SSID and IP
+            status_color = self.AUDI_GREEN
+            status_icon = "●"
+
+            # SSID row
+            ssid_text = f"{status_icon} {wifi_info['ssid']}"
+            ssid_surface = self._font_small.render(ssid_text, True, status_color)
+            ssid_rect = ssid_surface.get_rect(center=(240, wifi_y))
+            self.screen.blit(ssid_surface, ssid_rect)
+
+            # IP row
+            ip_text = wifi_info["ip"]
+            ip_surface = self._font_small.render(ip_text, True, self.AUDI_GRAY)
+            ip_rect = ip_surface.get_rect(center=(240, wifi_y + 28))
+            self.screen.blit(ip_surface, ip_rect)
+
+        else:
+            # Not connected - show warning
+            status_color = self.AUDI_AMBER
+            status_text = "○ WiFi Not Connected"
+            status_surface = self._font_small.render(status_text, True, status_color)
+            status_rect = status_surface.get_rect(center=(240, wifi_y + 14))
+            self.screen.blit(status_surface, status_rect)
+
+        # Divider line
+        divider_y = wifi_y + 60
+        pygame.draw.line(self.screen, self.AUDI_DIVIDER, (80, divider_y), (400, divider_y), 1)
+
+        # === Hotspot Section (below divider) ===
+        hotspot_y_base = divider_y + 20
 
         if self.hotspot_starting:
-            # Starting hotspot - show spinner
+            # Starting hotspot - show spinner with Audi amber
             dots = "." * (int(time.time() * 3) % 4)
-            status_text = self._font_small.render(f"Starting hotspot{dots}", True, self.YELLOW)
-            status_rect = status_text.get_rect(center=(240, 200))
+            status_text = self._font_small.render(f"Starting hotspot{dots}", True, self.AUDI_AMBER)
+            status_rect = status_text.get_rect(center=(240, hotspot_y_base + 80))
             self.screen.blit(status_text, status_rect)
 
         elif self.hotspot_stopping:
             # Stopping hotspot
             dots = "." * (int(time.time() * 3) % 4)
-            status_text = self._font_small.render(f"Stopping{dots}", True, self.YELLOW)
-            status_rect = status_text.get_rect(center=(240, 200))
+            status_text = self._font_small.render(f"Stopping{dots}", True, self.AUDI_AMBER)
+            status_rect = status_text.get_rect(center=(240, hotspot_y_base + 80))
             self.screen.blit(status_text, status_rect)
 
         elif self.hotspot_active:
-            # Hotspot is ON - show single QR code (WiFi auto-connect)
+            # Hotspot is ON - show QR code (smaller to fit)
             if self.qr_surface:
-                qr_rect = self.qr_surface.get_rect(center=(240, 170))
-                self.screen.blit(self.qr_surface, qr_rect)
+                # Draw card background for QR
+                card_rect = pygame.Rect(160, hotspot_y_base + 5, 160, 160)
+                pygame.draw.rect(self.screen, self.AUDI_CHARCOAL, card_rect)
+                pygame.draw.rect(self.screen, self.AUDI_DIVIDER, card_rect, 1)
 
-            # Instructions
-            inst1 = self._font_tiny.render("Scan to join WiFi", True, self.WHITE)
-            inst1_rect = inst1.get_rect(center=(240, 270))
-            self.screen.blit(inst1, inst1_rect)
+                # Scale QR to fit
+                qr_scaled = pygame.transform.scale(self.qr_surface, (140, 140))
+                qr_rect = qr_scaled.get_rect(center=(240, hotspot_y_base + 85))
+                self.screen.blit(qr_scaled, qr_rect)
 
-            inst2 = self._font_tiny.render("Then open: 192.168.4.1:8080", True, self.GRAY)
-            inst2_rect = inst2.get_rect(center=(240, 295))
-            self.screen.blit(inst2, inst2_rect)
-
-            # Connection status
+            # Connection status below QR
             if self.client_connected:
-                conn_color = self.GREEN
-                conn_text = "● Phone Connected!"
+                conn_color = self.AUDI_GREEN
+                conn_text = "● Phone Connected"
             else:
-                conn_color = self.YELLOW
-                conn_text = "○ Waiting for phone..."
+                conn_color = self.AUDI_AMBER
+                conn_text = "○ Scan QR to connect"
 
-            conn_surface = self._font_small.render(conn_text, True, conn_color)
-            conn_rect = conn_surface.get_rect(center=(240, 340))
+            conn_surface = self._font_tiny.render(conn_text, True, conn_color)
+            conn_rect = conn_surface.get_rect(center=(240, hotspot_y_base + 180))
             self.screen.blit(conn_surface, conn_rect)
 
             # Tap to stop hint
-            hint = self._font_tiny.render("tap to stop hotspot", True, self.GRAY)
-            hint_rect = hint.get_rect(center=(240, 395))
+            hint = self._font_tiny.render("tap to stop hotspot", True, self.AUDI_GRAY_MUTED)
+            hint_rect = hint.get_rect(center=(240, hotspot_y_base + 205))
             self.screen.blit(hint, hint_rect)
 
         else:
-            # Hotspot is OFF - show start button
-            # Draw big tap target
-            pygame.draw.circle(self.screen, (50, 70, 50), (240, 200), 80)
-            pygame.draw.circle(self.screen, self.GREEN, (240, 200), 80, 3)
+            # Hotspot is OFF - show compact start button
+            # Draw tap target with Audi red
+            btn_y = hotspot_y_base + 75
+            pygame.draw.circle(self.screen, self.AUDI_RED_DIM, (240, btn_y), 55)
+            pygame.draw.circle(self.screen, self.AUDI_RED, (240, btn_y), 55, 2)
 
-            # WiFi icon (simple)
-            for i, r in enumerate([25, 45, 65]):
-                arc_color = self.GREEN if i < 2 else (80, 120, 80)
-                pygame.draw.arc(self.screen, arc_color, (240-r, 200-r, r*2, r*2), 0.5, 2.6, 3)
+            # WiFi icon in Audi red (smaller)
+            for i, r in enumerate([18, 32, 46]):
+                arc_color = self.AUDI_RED if i < 2 else self.AUDI_RED_DIM
+                pygame.draw.arc(self.screen, arc_color, (240-r, btn_y-r, r*2, r*2), 0.5, 2.6, 2)
 
             # Dot at bottom of wifi icon
-            gfxdraw.aacircle(self.screen, 240, 220, 6, self.GREEN)
-            gfxdraw.filled_circle(self.screen, 240, 220, 6, self.GREEN)
+            gfxdraw.aacircle(self.screen, 240, btn_y + 14, 4, self.AUDI_RED)
+            gfxdraw.filled_circle(self.screen, 240, btn_y + 14, 4, self.AUDI_RED)
 
-            # Text
-            start_text = self._font_small.render("TAP TO START", True, self.WHITE)
-            start_rect = start_text.get_rect(center=(240, 310))
+            # Text below button
+            start_text = self._font_tiny.render("TAP TO START HOTSPOT", True, self.AUDI_GRAY)
+            start_rect = start_text.get_rect(center=(240, btn_y + 75))
             self.screen.blit(start_text, start_rect)
 
-            hotspot_text = self._font_small.render("HOTSPOT", True, self.GREEN)
-            hotspot_rect = hotspot_text.get_rect(center=(240, 340))
-            self.screen.blit(hotspot_text, hotspot_rect)
-
-        # Navigation hints at bottom
-        hint_down = self._font_tiny.render("↓ gauges", True, self.GRAY)
-        hint_rect = hint_down.get_rect(center=(200, 440))
-        self.screen.blit(hint_down, hint_rect)
-
-        hint_right = self._font_tiny.render("← bluetooth", True, self.GRAY)
-        hint_rect = hint_right.get_rect(center=(280, 440))
-        self.screen.blit(hint_right, hint_rect)
+        # Audi MMI navigation hints (Row 2: WiFi/Settings)
+        self._draw_audi_nav_hints(["↑ bluetooth", "↓ system"])
 
     def _draw_bluetooth_screen(self):
-        """Draw the Bluetooth pairing screen."""
-        # Dark background
-        gfxdraw.filled_circle(self.screen, 240, 240, 220, self.DARK_GRAY)
-        gfxdraw.aacircle(self.screen, 240, 240, 220, self.GRAY)
+        """Draw the Bluetooth pairing screen - Audi MMI style."""
+        # Audi MMI dark background
+        self._draw_audi_screen_background()
 
-        # Title
-        title = self._font_medium.render("BLUETOOTH", True, self.BLUE)
-        title_rect = title.get_rect(center=(240, 55))
-        self.screen.blit(title, title_rect)
+        # Audi MMI header with red underline
+        self._draw_audi_header("BLUETOOTH")
 
         # Connection status - Show OBD socket status if available, otherwise BT pairing status
         if self.obd_connected or self.obd_connecting or self.obd_state == "error":
             # OBD Socket connection status (takes priority)
             if self.obd_connected:
-                status_color = self.GREEN
+                status_color = self.AUDI_GREEN
                 status_text = "OBD Connected"
             elif self.obd_connecting:
-                status_color = self.YELLOW
+                status_color = self.AUDI_AMBER
                 status_text = "Connecting..."
             else:  # error
-                status_color = self.RED
+                status_color = self.AUDI_RED
                 status_text = self.obd_state_msg[:25] if self.obd_state_msg else "Error"
 
             # Status indicator circle
             gfxdraw.aacircle(self.screen, 170, 90, 8, status_color)
             gfxdraw.filled_circle(self.screen, 170, 90, 8, status_color)
 
-            # Device/connection info
-            obd_label = self._font_small.render("OBD-II Data", True, self.WHITE)
+            # Device/connection info - Show actual device name if connected
+            if self.obd_connected_name:
+                device_name = self.obd_connected_name[:22]  # Truncate if too long
+            else:
+                device_name = "OBD-II Data"
+            obd_label = self._font_small.render(device_name, True, self.AUDI_WHITE)
             obd_rect = obd_label.get_rect(midleft=(190, 90))
             self.screen.blit(obd_label, obd_rect)
 
-            # Status text
-            status_surface = self._font_tiny.render(status_text, True, status_color)
-            status_rect = status_surface.get_rect(midleft=(190, 115))
-            self.screen.blit(status_surface, status_rect)
+            # Show address on second line if connected
+            if self.obd_connected_address:
+                addr_text = self.obd_connected_address[:25]  # Truncate if too long
+                addr_surface = self._font_tiny.render(addr_text, True, self.AUDI_GRAY)
+                addr_rect = addr_surface.get_rect(midleft=(190, 112))
+                self.screen.blit(addr_surface, addr_rect)
+                # Status text on third line
+                status_surface = self._font_tiny.render(status_text, True, status_color)
+                status_rect = status_surface.get_rect(midleft=(190, 130))
+                self.screen.blit(status_surface, status_rect)
+            else:
+                # Status text on second line (no address)
+                status_surface = self._font_tiny.render(status_text, True, status_color)
+                status_rect = status_surface.get_rect(midleft=(190, 115))
+                self.screen.blit(status_surface, status_rect)
 
         elif self.bt_status:
             if self.bt_status.connected:
-                status_color = self.GREEN
+                status_color = self.AUDI_GREEN
                 status_text = "Connected"
             elif self.bt_status.paired:
-                status_color = self.YELLOW
+                status_color = self.AUDI_AMBER
                 status_text = "Paired (not connected)"
             else:
-                status_color = self.RED
+                status_color = self.AUDI_RED
                 status_text = "Not paired"
 
             # Status indicator circle
@@ -1220,7 +1665,7 @@ class BoostGaugeTest:
 
             # Device name
             device_name = self.bt_status.device_name if self.bt_status.device_name else "No device"
-            name_surface = self._font_small.render(device_name, True, self.WHITE)
+            name_surface = self._font_small.render(device_name, True, self.AUDI_WHITE)
             name_rect = name_surface.get_rect(midleft=(190, 100))
             self.screen.blit(name_surface, name_rect)
 
@@ -1229,93 +1674,96 @@ class BoostGaugeTest:
             status_rect = status_surface.get_rect(midleft=(190, 125))
             self.screen.blit(status_surface, status_rect)
         else:
-            no_status = self._font_small.render("Status unknown", True, self.GRAY)
+            no_status = self._font_small.render("Status unknown", True, self.AUDI_GRAY)
             no_rect = no_status.get_rect(center=(240, 110))
             self.screen.blit(no_status, no_rect)
 
-        # Divider line
-        pygame.draw.line(self.screen, self.GRAY, (80, 145), (400, 145), 1)
+        # Divider line - Audi subtle gray
+        pygame.draw.line(self.screen, self.AUDI_DIVIDER, (80, 145), (400, 145), 1)
 
         # Device list or scanning message
         if self.bt_scanning:
-            # Scanning animation (simple dots)
+            # Scanning animation with Audi amber
             dots = "." * (int(time.time() * 3) % 4)
-            scan_text = self._font_small.render(f"Scanning{dots}", True, self.YELLOW)
+            scan_text = self._font_small.render(f"Scanning{dots}", True, self.AUDI_AMBER)
             scan_rect = scan_text.get_rect(center=(240, 220))
             self.screen.blit(scan_text, scan_rect)
         elif self.bt_devices:
-            # Show device list with name and MAC
+            # Show device list with Audi MMI styling
             list_y = 160
             item_height = 55  # Taller items to fit MAC address
-            for i, device in enumerate(self.bt_devices[:3]):  # Max 3 devices (taller items)
-                # Highlight selected
-                if i == self.bt_selected_device:
-                    pygame.draw.rect(self.screen, (40, 40, 60), (80, list_y + i * item_height - 5, 320, item_height - 5))
-                    text_color = self.YELLOW
-                    mac_color = (180, 180, 100)
-                else:
-                    text_color = self.WHITE
-                    mac_color = self.GRAY
+            for i, device in enumerate(self.bt_devices[:3]):  # Max 3 devices
+                # Determine if this device is connected/paired
+                is_connected = (self.obd_connected and
+                               self.obd_connected_address and
+                               device.mac in self.obd_connected_address)
+                is_paired = device.paired
+                is_selected = (i == self.bt_selected_device)
 
-                # Device name (top line)
-                name = device.name[:22] if len(device.name) > 22 else device.name
-                name_surface = self._font_small.render(name, True, text_color)
-                self.screen.blit(name_surface, (90, list_y + i * item_height))
-
-                # MAC address (below name, smaller)
-                mac_surface = self._font_tiny.render(device.mac, True, mac_color)
-                self.screen.blit(mac_surface, (90, list_y + i * item_height + 22))
-
-                # Paired indicator (right side)
-                if device.paired:
-                    paired_surface = self._font_tiny.render("PAIRED", True, self.GREEN)
-                    self.screen.blit(paired_surface, (350, list_y + i * item_height + 8))
+                # Use the Audi list item helper
+                self._draw_audi_list_item(
+                    y=list_y + i * item_height,
+                    name=device.name[:22] if len(device.name) > 22 else device.name,
+                    subtitle=device.mac,
+                    selected=is_selected,
+                    connected=is_connected,
+                    paired=is_paired
+                )
         else:
-            # No devices
-            no_dev = self._font_small.render("Tap SCAN to find devices", True, self.GRAY)
+            # No devices - Audi gray text
+            no_dev = self._font_small.render("Tap SCAN to find devices", True, self.AUDI_GRAY)
             no_rect = no_dev.get_rect(center=(240, 220))
             self.screen.blit(no_dev, no_rect)
 
-        # Buttons at bottom
-        btn_y = 380
+        # Buttons with Audi styling
+        btn_y = 340
+        btn_rect_left = pygame.Rect(70, btn_y, 140, 50)
+        btn_rect_right = pygame.Rect(270, btn_y, 140, 50)
 
-        # SCAN button (left)
-        pygame.draw.rect(self.screen, (40, 60, 80), (70, btn_y, 140, 50))
-        pygame.draw.rect(self.screen, self.BLUE, (70, btn_y, 140, 50), 2)
-        scan_btn = self._font_small.render("SCAN", True, self.WHITE)
-        scan_rect = scan_btn.get_rect(center=(140, btn_y + 25))
-        self.screen.blit(scan_btn, scan_rect)
+        # SCAN button (left) - disabled while connected
+        scan_active = not self.obd_connected
+        self._draw_audi_button("SCAN", btn_rect_left, active=scan_active, color_scheme="default")
 
-        # PAIR/CONNECT button (right)
-        btn_text = "CONNECT" if self.bt_devices else "PAIR"
-        pygame.draw.rect(self.screen, (40, 80, 60), (270, btn_y, 140, 50))
-        pygame.draw.rect(self.screen, self.GREEN, (270, btn_y, 140, 50), 2)
-        pair_btn = self._font_small.render(btn_text, True, self.WHITE)
-        pair_rect = pair_btn.get_rect(center=(340, btn_y + 25))
-        self.screen.blit(pair_btn, pair_rect)
+        # Right button - changes based on connection state
+        if self.obd_connected:
+            # Connected: Show red DISCONNECT button
+            if getattr(self, 'disconnect_confirm', False):
+                btn_text = "CONFIRM?"
+                self._draw_audi_button(btn_text, btn_rect_right, active=True, pressed=True, color_scheme="red")
+            else:
+                btn_text = "DISCONNECT"
+                self._draw_audi_button(btn_text, btn_rect_right, active=True, color_scheme="red")
+        elif self.obd_connecting:
+            # Connecting: Show amber connecting state
+            btn_text = "CONNECTING"
+            # Draw custom connecting state with amber
+            pygame.draw.rect(self.screen, self.AUDI_CHARCOAL, btn_rect_right)
+            pygame.draw.rect(self.screen, self.AUDI_AMBER, btn_rect_right, 2)
+            text_surface = self._font_small.render(btn_text, True, self.AUDI_AMBER)
+            text_rect = text_surface.get_rect(center=btn_rect_right.center)
+            self.screen.blit(text_surface, text_rect)
+        else:
+            # Not connected: Show green CONNECT button
+            btn_text = "CONNECT" if self.bt_devices else "PAIR"
+            self._draw_audi_button(btn_text, btn_rect_right, active=True, color_scheme="green")
 
-        # Navigation hints
-        hint = self._font_tiny.render("↓ gauges  → settings", True, self.GRAY)
-        hint_rect = hint.get_rect(center=(240, 455))
-        self.screen.blit(hint, hint_rect)
+        # Audi MMI navigation hints
+        self._draw_audi_nav_hints(["↑ gauges", "↓ wifi/settings"])
 
     def _draw_brightness_screen(self):
-        """Draw the system settings screen (demo mode, brightness, power)."""
-        # Dark background
-        gfxdraw.filled_circle(self.screen, 240, 240, 220, self.DARK_GRAY)
-        gfxdraw.aacircle(self.screen, 240, 240, 220, self.GRAY)
+        """Draw the system settings screen (demo mode, brightness, power) - Audi MMI style."""
+        # Audi MMI dark background
+        self._draw_audi_screen_background()
 
-        # Title
-        title = self._font_medium.render("SYSTEM", True, self.GOLD)
-        title_rect = title.get_rect(center=(240, 55))
-        self.screen.blit(title, title_rect)
+        # Audi MMI header with red underline
+        self._draw_audi_header("SYSTEM")
 
         # Demo Mode toggle (top section)
-        demo_label = self._font_small.render("Demo Mode", True, self.WHITE)
+        demo_label = self._font_small.render("Demo Mode", True, self.AUDI_WHITE)
         demo_label_rect = demo_label.get_rect(midleft=(90, 100))
         self.screen.blit(demo_label, demo_label_rect)
 
-        # Toggle button for demo mode
+        # Toggle button for demo mode - Audi style
         toggle_x = 340
         toggle_y = 100
         toggle_width = 60
@@ -1323,37 +1771,37 @@ class BoostGaugeTest:
         toggle_rect = pygame.Rect(toggle_x - toggle_width//2, toggle_y - toggle_height//2, toggle_width, toggle_height)
 
         if self.demo_mode:
-            # ON state - green background, knob on right
-            self._draw_capsule((40, 100, 40), toggle_rect)  # Filled
-            self._draw_capsule(self.GREEN, toggle_rect, 2)  # Outline
+            # ON state - Audi red background, knob on right
+            self._draw_capsule(self.AUDI_RED_DIM, toggle_rect)  # Filled
+            self._draw_capsule(self.AUDI_RED, toggle_rect, 2)  # Outline
             knob_pos = toggle_x + toggle_width//2 - 14
-            on_text = self._font_tiny.render("ON", True, self.GREEN)
+            on_text = self._font_tiny.render("ON", True, self.AUDI_RED)
         else:
             # OFF state - dark background, knob on left
-            self._draw_capsule((60, 60, 60), toggle_rect)  # Filled
-            self._draw_capsule(self.GRAY, toggle_rect, 2)  # Outline
+            self._draw_capsule(self.AUDI_CHARCOAL, toggle_rect)  # Filled
+            self._draw_capsule(self.AUDI_GRAY_MUTED, toggle_rect, 2)  # Outline
             knob_pos = toggle_x - toggle_width//2 + 14
-            on_text = self._font_tiny.render("OFF", True, self.GRAY)
+            on_text = self._font_tiny.render("OFF", True, self.AUDI_GRAY_MUTED)
 
         # Draw toggle knob
-        gfxdraw.aacircle(self.screen, knob_pos, toggle_y, 10, self.WHITE)
-        gfxdraw.filled_circle(self.screen, knob_pos, toggle_y, 10, self.WHITE)
+        gfxdraw.aacircle(self.screen, knob_pos, toggle_y, 10, self.AUDI_WHITE)
+        gfxdraw.filled_circle(self.screen, knob_pos, toggle_y, 10, self.AUDI_WHITE)
 
         # Demo mode description
-        demo_desc = self._font_tiny.render("Needle sweep test animation", True, self.GRAY)
+        demo_desc = self._font_tiny.render("Needle sweep test animation", True, self.AUDI_GRAY)
         demo_desc_rect = demo_desc.get_rect(midleft=(90, 125))
         self.screen.blit(demo_desc, demo_desc_rect)
 
-        # Divider after demo mode
-        pygame.draw.line(self.screen, self.GRAY, (100, 150), (380, 150), 1)
+        # Divider after demo mode - Audi subtle gray
+        pygame.draw.line(self.screen, self.AUDI_DIVIDER, (100, 150), (380, 150), 1)
 
         # Brightness section (moved down)
-        bright_label = self._font_small.render("Brightness", True, self.WHITE)
+        bright_label = self._font_small.render("Brightness", True, self.AUDI_WHITE)
         bright_rect = bright_label.get_rect(midleft=(90, 180))
         self.screen.blit(bright_label, bright_rect)
 
-        # Current percentage
-        pct_text = self._font_small.render(f"{self.brightness}%", True, self.YELLOW)
+        # Current percentage - Audi red accent
+        pct_text = self._font_small.render(f"{self.brightness}%", True, self.AUDI_RED)
         pct_rect = pct_text.get_rect(midright=(390, 180))
         self.screen.blit(pct_text, pct_rect)
 
@@ -1363,62 +1811,53 @@ class BoostGaugeTest:
         slider_right = 390
         slider_width = slider_right - slider_left
 
-        # Track background
-        pygame.draw.rect(self.screen, (50, 50, 60), (slider_left, slider_y - 10, slider_width, 20))
-        pygame.draw.rect(self.screen, self.GRAY, (slider_left, slider_y - 10, slider_width, 20), 1)
+        # Track background - Audi dark
+        pygame.draw.rect(self.screen, self.AUDI_DARK, (slider_left, slider_y - 10, slider_width, 20))
+        pygame.draw.rect(self.screen, self.AUDI_DIVIDER, (slider_left, slider_y - 10, slider_width, 20), 1)
 
-        # Filled portion
+        # Filled portion - Audi red gradient
         fill_pct = (self.brightness - self.min_brightness) / (self.max_brightness - self.min_brightness)
         fill_width = int(slider_width * fill_pct)
-        pygame.draw.rect(self.screen, self.GOLD, (slider_left, slider_y - 10, fill_width, 20))
+        if fill_width > 0:
+            pygame.draw.rect(self.screen, self.AUDI_RED, (slider_left, slider_y - 10, fill_width, 20))
 
-        # Slider knob
+        # Slider knob - White with red center
         knob_x = slider_left + fill_width
-        gfxdraw.aacircle(self.screen, knob_x, slider_y, 12, self.WHITE)
-        gfxdraw.filled_circle(self.screen, knob_x, slider_y, 12, self.WHITE)
-        gfxdraw.aacircle(self.screen, knob_x, slider_y, 10, self.GOLD)
-        gfxdraw.filled_circle(self.screen, knob_x, slider_y, 10, self.GOLD)
+        gfxdraw.aacircle(self.screen, knob_x, slider_y, 12, self.AUDI_WHITE)
+        gfxdraw.filled_circle(self.screen, knob_x, slider_y, 12, self.AUDI_WHITE)
+        gfxdraw.aacircle(self.screen, knob_x, slider_y, 8, self.AUDI_RED)
+        gfxdraw.filled_circle(self.screen, knob_x, slider_y, 8, self.AUDI_RED)
 
         # Min/max labels
-        min_label = self._font_tiny.render("10%", True, self.GRAY)
+        min_label = self._font_tiny.render("10%", True, self.AUDI_GRAY_MUTED)
         self.screen.blit(min_label, (slider_left, slider_y + 15))
-        max_label = self._font_tiny.render("100%", True, self.GRAY)
+        max_label = self._font_tiny.render("100%", True, self.AUDI_GRAY_MUTED)
         max_rect = max_label.get_rect(topright=(slider_right, slider_y + 15))
         self.screen.blit(max_label, max_rect)
 
         # Note about brightness
-        bright_note = self._font_tiny.render("(Software dimming for night driving)", True, self.GRAY)
+        bright_note = self._font_tiny.render("(Software dimming for night driving)", True, self.AUDI_GRAY_MUTED)
         bright_note_rect = bright_note.get_rect(center=(240, 255))
         self.screen.blit(bright_note, bright_note_rect)
 
         # Divider before power
-        pygame.draw.line(self.screen, self.GRAY, (100, 280), (380, 280), 1)
+        pygame.draw.line(self.screen, self.AUDI_DIVIDER, (100, 280), (380, 280), 1)
 
         # Power section label
-        power_label = self._font_small.render("Power", True, self.WHITE)
+        power_label = self._font_small.render("Power", True, self.AUDI_WHITE)
         power_rect = power_label.get_rect(center=(240, 305))
         self.screen.blit(power_label, power_rect)
 
-        # Shutdown button (left)
+        # Shutdown button (left) - Audi red style
         shutdown_btn_rect = pygame.Rect(70, 335, 150, 55)
-        pygame.draw.rect(self.screen, (80, 40, 40), shutdown_btn_rect)
-        pygame.draw.rect(self.screen, self.RED, shutdown_btn_rect, 2)
-        shutdown_text = self._font_small.render("SHUTDOWN", True, self.WHITE)
-        shutdown_text_rect = shutdown_text.get_rect(center=shutdown_btn_rect.center)
-        self.screen.blit(shutdown_text, shutdown_text_rect)
+        self._draw_audi_button("SHUTDOWN", shutdown_btn_rect, active=True, color_scheme="red")
 
-        # Reboot button (right)
+        # Reboot button (right) - Audi default style
         reboot_btn_rect = pygame.Rect(260, 335, 150, 55)
-        pygame.draw.rect(self.screen, (40, 60, 80), reboot_btn_rect)
-        pygame.draw.rect(self.screen, self.BLUE, reboot_btn_rect, 2)
-        reboot_text = self._font_small.render("REBOOT", True, self.WHITE)
-        reboot_text_rect = reboot_text.get_rect(center=reboot_btn_rect.center)
-        self.screen.blit(reboot_text, reboot_text_rect)
+        self._draw_audi_button("REBOOT", reboot_btn_rect, active=True, color_scheme="default")
 
-        # Navigation hint
-        hint = self._font_tiny.render("↑ back to settings", True, self.GRAY)
-        hint_rect = hint.get_rect(center=(240, 420))
-        self.screen.blit(hint, hint_rect)
+        # Audi MMI navigation hints
+        self._draw_audi_nav_hints(["↑ wifi/settings"])
 
     def _draw_settings_screen(self):
         """Draw the old settings screen - now redirects to QR screen."""
@@ -1486,10 +1925,24 @@ class BoostGaugeTest:
         else:
             self.obd_state = str(state)
         self.obd_state_msg = msg
+        was_connecting = self.obd_connecting
         self.obd_connected = (state == ConnectionState.CONNECTED) if ConnectionState else False
         self.obd_connecting = (state == ConnectionState.CONNECTING or
                                state == ConnectionState.INITIALIZING) if ConnectionState else False
         print(f"[OBD] State: {self.obd_state} - {msg}")
+
+        # Persist connected device info for display
+        if self.obd_connected and was_connecting:
+            self.obd_connected_address = self.obd_connecting_mac
+            self.obd_connected_name = self.obd_connecting_name or "Unknown"
+            print(f"[OBD] Connected to: {self.obd_connected_name} ({self.obd_connected_address})")
+
+        # Save device to settings when successfully connected via BT (not simulator)
+        if self.obd_connected and was_connecting and self.obd_connecting_mac:
+            # Check if it's a real BT MAC (not TCP address like 10.0.0.x:port)
+            if ':' in self.obd_connecting_mac and not '.' in self.obd_connecting_mac:
+                self._save_bt_device(self.obd_connecting_mac, self.obd_connecting_name)
+                print(f"[OBD] Saved BT device for auto-connect: {self.obd_connecting_name}")
 
     def _obd_data_callback(self, data):
         """Called by OBDSocket with new OBD data."""
@@ -1511,11 +1964,20 @@ class BoostGaugeTest:
         self.simulated_values['RPM'] = data.rpm
         self.simulated_values['THROTTLE_POS'] = data.throttle_pos
 
-    def _start_obd_connection_async(self, mac):
-        """Start OBD connection process in background (includes pairing)."""
+    def _start_obd_connection_async(self, mac, name=None):
+        """Start OBD connection process in background (includes pairing).
+
+        Args:
+            mac: MAC address (BT) or IP:port (TCP simulator)
+            name: Device name (optional, used for saving to settings)
+        """
         if self.obd_connecting:
             print("[OBD] Already connecting...")
             return
+
+        # Store for later use in state callback (to save device on successful connect)
+        self.obd_connecting_mac = mac
+        self.obd_connecting_name = name
 
         def connection_thread():
             try:
@@ -1626,6 +2088,8 @@ class BoostGaugeTest:
         self.obd_connecting = False
         self.obd_state = "disconnected"
         self.obd_state_msg = ""
+        self.obd_connected_address = None
+        self.obd_connected_name = None
 
     def _simulate_boost(self, t):
         """Simulate boost pressure changes."""
@@ -1651,16 +2115,21 @@ class BoostGaugeTest:
             progress = (cycle - 6) / 2
             return -5 - (progress * 7)
 
-    def run(self, target_fps=30, obd_rate=10):
+    def run(self, target_fps=None, obd_rate=10):
         """Main loop with FPS benchmark.
 
-        target_fps: Display refresh rate
+        target_fps: Display refresh rate (defaults to settings.json value)
         obd_rate: Simulated OBD2 data rate (updates per second)
         """
+        # Use settings.json fps if not explicitly overridden
+        if target_fps is None:
+            target_fps = getattr(self, 'target_fps', 30)
+
         self._running = True
         signal.signal(signal.SIGINT, self._exit)
 
-        # Auto-connect to simulator if enabled
+        # Auto-connect to OBD device on startup
+        # Priority: 1. Simulator (if enabled), 2. Saved BT device (if configured)
         try:
             import json
             import os
@@ -1668,13 +2137,26 @@ class BoostGaugeTest:
             if os.path.exists(settings_path):
                 with open(settings_path) as f:
                     settings = json.load(f)
+
                 sim_config = settings.get("simulator", {})
+                obd_config = settings.get("obd", {})
+
                 if sim_config.get("enabled") and sim_config.get("address"):
+                    # Simulator mode - connect to TCP simulator
                     sim_addr = sim_config["address"]
                     print(f"[OBD] Auto-connecting to simulator at {sim_addr}...")
-                    self._start_obd_connection_async(sim_addr)
+                    self._start_obd_connection_async(sim_addr, "Simulator")
+                elif obd_config.get("bt_device_mac"):
+                    # Real OBD mode - connect to saved Bluetooth device
+                    bt_mac = obd_config["bt_device_mac"]
+                    bt_name = obd_config.get("bt_device_name", "OBD Device")
+                    print(f"[OBD] Auto-connecting to saved BT device: {bt_name} ({bt_mac})...")
+                    self.demo_mode = False  # Disable demo mode for real OBD
+                    self._start_obd_connection_async(bt_mac, bt_name)
+                else:
+                    print("[OBD] No OBD device configured - starting in demo mode")
         except Exception as e:
-            print(f"[OBD] Could not load simulator config: {e}")
+            print(f"[OBD] Could not load OBD config: {e}")
 
         start_time = time.time()
         last_frame_time = start_time
@@ -1735,31 +2217,22 @@ class BoostGaugeTest:
 
             # Draw based on 2D grid position
             if self.screen_row == 0:
-                # Row 0: Gauge screens
-                if self.screen_col == 0:
-                    # Boost gauge
-                    self._draw_gauge_face()
-                    self._draw_needle(self.boost_psi)
-                    self._draw_digital_readout(self.boost_psi)
-                elif self.screen_col == 1:
-                    # Temperature gauge
-                    self._draw_temp_gauge(self.coolant_temp)
-                elif self.screen_col == 2:
-                    # Engine load gauge
-                    self._draw_load_gauge(self.engine_load)
-                elif self.screen_col == 3:
-                    # Shift light (full-screen peripheral vision indicator)
+                # Row 0: Gauge screens (dynamically from gauge_configs)
+                if self.screen_col < len(self.gauge_configs):
+                    # Draw configured gauge
+                    gauge = self.gauge_configs[self.screen_col]
+                    self._draw_configured_gauge(gauge)
+                elif self.screen_col == len(self.gauge_configs):
+                    # Shift light is always last (full-screen peripheral vision indicator)
                     self._draw_shift_light_screen()
             elif self.screen_row == 1:
-                # Row 1: Settings screens
-                if self.screen_col == 0:
-                    # QR Settings screen
-                    self._draw_qr_settings_screen()
-                elif self.screen_col == 1:
-                    # Bluetooth screen
-                    self._draw_bluetooth_screen()
+                # Row 1: Bluetooth screen (only)
+                self._draw_bluetooth_screen()
             elif self.screen_row == 2:
-                # Row 2: Brightness screen
+                # Row 2: WiFi/Settings/QR screen
+                self._draw_qr_settings_screen()
+            elif self.screen_row == 3:
+                # Row 3: System screen (Brightness/Reboot/Restart)
                 self._draw_brightness_screen()
 
             self._draw_fps()
@@ -1815,16 +2288,19 @@ Recommended settings: --fps 30 --obd 25 --smooth 0.25
 
 With OBDLink MX+ at 25Hz, tweening barely needed - data is fast enough!
     """, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--fps', type=int, default=30,
-                       help='Target display FPS (default: 30, balance of smooth vs CPU)')
+    parser.add_argument('--fps', type=int, default=None,
+                       help='Target display FPS (default: from settings.json, or 60)')
     parser.add_argument('--obd', type=int, default=25,
                        help='Simulated OBD2 data rate Hz (default: 25, realistic for OBDLink MX+)')
-    parser.add_argument('--smooth', type=float, default=0.25,
-                       help='Smoothing factor 0.1-0.3 (default: 0.25, responsive for fast data)')
+    parser.add_argument('--smooth', type=float, default=None,
+                       help='Smoothing factor 0.1-0.3 (default: from settings.json, or 0.15)')
     args = parser.parse_args()
 
     gauge = BoostGaugeTest()
-    gauge.smoothing = args.smooth
+
+    # Override smoothing only if specified on command line
+    if args.smooth is not None:
+        gauge.smoothing = args.smooth
 
     # Initialize touch at module level BEFORE run() - same pattern as working clock-ytsc.py
     try:

@@ -144,6 +144,8 @@ At `--fps 30 --obd 25`:
 
 ## Documentation
 
+- `docs/BLUETOOTH_OBD_SETUP.md` - **Complete Bluetooth OBD setup guide** (recommended)
+- `docs/PERFORMANCE_OPTIMIZATION.md` - Animation & performance learnings from aa-torque
 - `docs/obd-optimization.md` - OBD2 data rates and tweening
 - `docs/hardware.md` - Pi Zero 2W + HyperPixel setup
 
@@ -194,11 +196,23 @@ The HyperPixel 2r has a **binary backlight** (on/off via GPIO) with no PWM dimmi
 - [x] Settings screen UI
 - [x] WiFi hotspot mode (tap to start, phone connects)
 - [x] Web-based settings page (192.168.4.1:8080)
-- [ ] OBD2 Bluetooth connection
-- [ ] Real data from OBD2 PIDs
+- [x] **OBD2 Bluetooth connection** - Working with OBDLink MX+ (native socket)
+- [x] **Real data from OBD2 PIDs** - Throttle, Boost (MAP), Coolant Temp, RPM
 - [ ] Settings save/load (partially working)
 
 ## Changelog
+
+### 2025-12-10 (Evening) - Milestone: OBD2 Bluetooth Working!
+- **OBD2 Bluetooth connection fully operational** with OBDLink MX+
+- Fixed fast query timeout (0.1s→0.3s) - was causing immediate disconnect after connection
+- Fixed `query_fast()` method placement (was outside class)
+- Analyzed aa-torque repo for performance optimization techniques
+- Added comprehensive documentation:
+  - `docs/BLUETOOTH_OBD_SETUP.md` - Complete setup and troubleshooting guide
+  - `docs/PERFORMANCE_OPTIMIZATION.md` - Animation learnings from aa-torque
+- Key insight: Animation duration should match data refresh rate for smooth gauges
+- Achieved ~5.2 Hz effective polling rate with prioritized throttle queries
+- Remaining ~100-300ms delay is inherent Bluetooth SPP latency
 
 ### 2025-12-07 (Evening) - Milestone: WiFi Hotspot + Web Settings Working
 - **WiFi hotspot mode working!** Tap on Settings screen to start/stop
