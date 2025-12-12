@@ -24,14 +24,14 @@
       "label": "BOOST",
       "needle": "audi3",
       "conversion": "none",
-      "min": -15,
-      "max": 25
+      "min": -20,
+      "max": 30
     }
   ],
   "display": {
     "fps": 60,
     "smoothing": 0.25,
-    "dial_background": "audi3",
+    "dial_background": "audi",
     "demo_mode": false,
     "animated_transitions": true
   },

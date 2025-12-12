@@ -133,6 +133,11 @@ class BoostGaugeTest:
         self._current_dial_bg = None
         self._load_dial_backgrounds()
 
+        # Performance: Pre-render static elements
+        self._label_cache = {}  # Cache for perimeter number surfaces {(min,max): [surfaces]}
+        self._hub_surface = None  # Pre-rendered center hub
+        self._init_hub_surface()
+
         # FPS tracking
         self.frame_count = 0
         self.fps_timer = time.time()
@@ -406,6 +411,46 @@ class BoostGaugeTest:
             print(f"[Dial] Active background: {self.dial_background}")
         else:
             print(f"[Dial] Using procedural rendering (dial_background={self.dial_background})")
+
+    def _init_hub_surface(self):
+        """Pre-render center hub as a surface for fast blitting.
+
+        Performance optimization: drawing filled circles with gfxdraw is slow.
+        Pre-rendering once and blitting is much faster.
+        """
+        hub_radius = 70
+        size = hub_radius * 2 + 4  # Add margin for anti-aliasing
+        self._hub_surface = pygame.Surface((size, size), pygame.SRCALPHA)
+
+        center = size // 2
+        # Outer charcoal circle
+        gfxdraw.aacircle(self._hub_surface, center, center, hub_radius, self.AUDI_CHARCOAL)
+        gfxdraw.filled_circle(self._hub_surface, center, center, hub_radius, self.AUDI_CHARCOAL)
+        # Inner red accent
+        gfxdraw.aacircle(self._hub_surface, center, center, 15, self.AUDI_RED)
+        gfxdraw.filled_circle(self._hub_surface, center, center, 15, self.AUDI_RED)
+
+        self._hub_offset = center  # For centering when blitting
+        print(f"[Perf] Pre-rendered hub surface ({size}x{size})")
+
+    def _get_cached_labels(self, min_val, max_val):
+        """Get cached perimeter label surfaces, creating if needed.
+
+        Performance optimization: font.render() is expensive.
+        Cache the rendered surfaces and reuse them.
+        """
+        cache_key = (int(min_val), int(max_val))
+        if cache_key not in self._label_cache:
+            labels = []
+            num_labels = 6
+            step = (max_val - min_val) / (num_labels - 1)
+            for i in range(num_labels):
+                val = min_val + (i * step)
+                surface = self._font_small.render(f"{int(val)}", True, self.WHITE)
+                labels.append(surface)
+            self._label_cache[cache_key] = labels
+            print(f"[Perf] Cached {num_labels} label surfaces for range {min_val}-{max_val}")
+        return self._label_cache[cache_key]
 
     def reload_settings(self):
         """Reload settings from file. Call this when Web UI updates settings.json."""
@@ -1423,7 +1468,7 @@ class BoostGaugeTest:
         # Apply software dimming overlay if brightness < 100%
         if self._dim_overlay is not None:
             self.screen.blit(self._dim_overlay, (0, 0))
-        
+
         if self._rawfb:
             fbdev = os.getenv('SDL_FBDEV', '/dev/fb0')
             # HyperPixel 2r has 480x480 physical but 720x480 virtual framebuffer
@@ -1434,14 +1479,24 @@ class BoostGaugeTest:
             # Physical: 480x480, Virtual: 720x480, 16bpp = 2 bytes per pixel
             fb_stride = 720 * 2  # bytes per row in framebuffer
             screen_stride = 480 * 2  # bytes per row in our surface
-            padding = fb_stride - screen_stride  # extra bytes per row
+            pad_bytes = fb_stride - screen_stride  # extra bytes per row (480 bytes)
+
+            # PERF: Build entire padded buffer in memory, then single write
+            # (Old code: 480 small writes = 960 syscalls per frame)
+            # (New code: 1 large write = 1 syscall per frame)
+            if not hasattr(self, '_fb_buffer'):
+                self._fb_buffer = bytearray(fb_stride * 480)
+                self._fb_pad = bytes(pad_bytes)  # Pre-allocate padding bytes
+
+            # Copy rows with padding
+            for y in range(480):
+                src_start = y * screen_stride
+                dst_start = y * fb_stride
+                self._fb_buffer[dst_start:dst_start + screen_stride] = raw_data[src_start:src_start + screen_stride]
+                # Padding area is already zeros from bytearray init
 
             with open(fbdev, 'wb') as fb:
-                for y in range(480):
-                    row_start = y * screen_stride
-                    row_end = row_start + screen_stride
-                    fb.write(raw_data[row_start:row_end])
-                    fb.write(b'\x00' * padding)  # pad to match stride
+                fb.write(self._fb_buffer)  # Single write!
         else:
             pygame.display.flip()
 
@@ -1460,27 +1515,31 @@ class BoostGaugeTest:
             pygame.draw.line(self.screen, color, (x1, y1), (x2, y2), thickness)
 
     def _draw_needle(self, psi):
-        """Draw the gauge needle."""
+        """Draw the gauge needle - thin tapered style with center circle masking."""
         # Map PSI to angle
         psi_range = self.max_psi - self.min_psi
         psi_normalized = (psi - self.min_psi) / psi_range
         angle = self.start_angle + (psi_normalized * self.sweep_angle)
 
-        # Needle points
-        tip = self._get_point(self.center, angle, 160)
-        base_left = self._get_point(self.center, angle + 90, 15)
-        base_right = self._get_point(self.center, angle - 90, 15)
-        tail = self._get_point(self.center, angle + 180, 30)
+        # Needle geometry: thin tapered needle from center to outer ring
+        center_circle_radius = 75  # Match the Audi dial's inner circle
+        needle_tip_radius = 160    # How far the tip extends
+        needle_base_width = 4      # Width at the base (thin like audi3 needle)
 
-        # Draw needle (filled polygon)
-        pygame.draw.polygon(self.screen, self.RED, [tip, base_left, tail, base_right])
-        pygame.draw.polygon(self.screen, self.WHITE, [tip, base_left, tail, base_right], 2)
+        # Calculate needle points - simple triangle from center outward
+        tip = self._get_point(self.center, angle, needle_tip_radius)
+        base_left = self._get_point(self.center, angle + 90, needle_base_width)
+        base_right = self._get_point(self.center, angle - 90, needle_base_width)
 
-        # Center hub
-        gfxdraw.aacircle(self.screen, 240, 240, 20, self.GRAY)
-        gfxdraw.filled_circle(self.screen, 240, 240, 20, self.GRAY)
-        gfxdraw.aacircle(self.screen, 240, 240, 10, self.WHITE)
-        gfxdraw.filled_circle(self.screen, 240, 240, 10, self.WHITE)
+        # Draw needle as triangle (tip + 2 base points at center)
+        pygame.draw.polygon(self.screen, self.RED, [tip, base_left, base_right])
+        pygame.draw.polygon(self.screen, self.WHITE, [tip, base_left, base_right], 1)
+
+        # Center hub - blit pre-rendered surface (PERF: much faster than gfxdraw per frame)
+        if self._hub_surface:
+            hub_x = 240 - self._hub_offset
+            hub_y = 240 - self._hub_offset
+            self.screen.blit(self._hub_surface, (hub_x, hub_y))
 
     def _draw_gauge_face(self):
         """Draw the static gauge face elements."""
@@ -1602,8 +1661,20 @@ class BoostGaugeTest:
 
         if use_image_bg:
             # HYBRID MODE: Blit dial background image first
-            # Image provides: chrome bezel, carbon fiber texture, graduations, numbers
+            # Image provides: chrome bezel, carbon fiber texture
             self.screen.blit(self._current_dial_bg, (0, 0))
+
+            # Draw perimeter numbers using cached surfaces (PERF: no font.render per frame)
+            cached_labels = self._get_cached_labels(min_val, max_val)
+            num_labels = len(cached_labels)
+            for i, label_surface in enumerate(cached_labels):
+                val_normalized = i / (num_labels - 1)
+                angle = self.start_angle + (val_normalized * self.sweep_angle)
+
+                # Position numbers at 155px from center (inside gauge ring)
+                label_pos = self._get_point(self.center, angle, 155)
+                label_rect = label_surface.get_rect(center=label_pos)
+                self.screen.blit(label_surface, label_rect)
         else:
             # PROCEDURAL MODE: Draw face elements manually
             # Outer ring
@@ -1645,23 +1716,32 @@ class BoostGaugeTest:
 
         # === PROCEDURAL OVERLAYS (drawn on both modes) ===
 
-        # Draw needle
+        # Draw needle - thin tapered style, appears to emerge from behind center circle
         val_normalized = max(0, min(1, (value - min_val) / (max_val - min_val)))
         angle = self.start_angle + (val_normalized * self.sweep_angle)
 
-        tip = self._get_point(self.center, angle, 160)
-        base_left = self._get_point(self.center, angle + 90, 15)
-        base_right = self._get_point(self.center, angle - 90, 15)
-        tail = self._get_point(self.center, angle + 180, 30)
+        # Needle geometry: thin tapered needle from center to outer ring
+        # The center circle drawn AFTER will mask the base
+        center_circle_radius = 75  # Match the Audi dial's inner circle
+        needle_tip_radius = 160    # How far the tip extends
+        needle_base_width = 4      # Width at the base (thin like audi3 needle)
 
-        pygame.draw.polygon(self.screen, self.RED, [tip, base_left, tail, base_right])
-        pygame.draw.polygon(self.screen, self.WHITE, [tip, base_left, tail, base_right], 2)
+        # Calculate needle points - simple triangle from center outward
+        tip = self._get_point(self.center, angle, needle_tip_radius)
+        base_left = self._get_point(self.center, angle + 90, needle_base_width)
+        base_right = self._get_point(self.center, angle - 90, needle_base_width)
 
-        # Center hub - Audi MMI style
-        gfxdraw.aacircle(self.screen, 240, 240, 20, self.AUDI_CHARCOAL)
-        gfxdraw.filled_circle(self.screen, 240, 240, 20, self.AUDI_CHARCOAL)
-        gfxdraw.aacircle(self.screen, 240, 240, 10, self.AUDI_RED)
-        gfxdraw.filled_circle(self.screen, 240, 240, 10, self.AUDI_RED)
+        # Draw needle as triangle (tip + 2 base points at center)
+        pygame.draw.polygon(self.screen, self.RED, [tip, base_left, base_right])
+        # White edge highlight
+        pygame.draw.polygon(self.screen, self.WHITE, [tip, base_left, base_right], 1)
+
+        # Center hub - blit pre-rendered surface (PERF: much faster than gfxdraw per frame)
+        # Drawn AFTER needle to create masking effect (needle appears behind)
+        if self._hub_surface:
+            hub_x = 240 - self._hub_offset
+            hub_y = 240 - self._hub_offset
+            self.screen.blit(self._hub_surface, (hub_x, hub_y))
 
         # Digital readout - Audi MMI style
         pygame.draw.rect(self.screen, self.AUDI_CHARCOAL, (170, 300, 140, 60))

@@ -144,10 +144,16 @@ At `--fps 30 --obd 25`:
 
 ## Documentation
 
-- `docs/BLUETOOTH_OBD_SETUP.md` - **Complete Bluetooth OBD setup guide** (recommended)
-- `docs/PERFORMANCE_OPTIMIZATION.md` - Animation & performance learnings from aa-torque
+### Getting Started
+- `INSTALL.md` - **Complete installation guide** (start here for new setup)
+- `CONTRIBUTING.md` - Development workflow and code structure
+- `CLAUDE.md` - Context for Claude Code sessions
+
+### Technical Docs
+- `docs/BLUETOOTH_OBD_SETUP.md` - Bluetooth OBD pairing and troubleshooting
+- `docs/PERFORMANCE_OPTIMIZATION.md` - Animation & performance learnings
+- `docs/hardware.md` - Pi Zero 2W + HyperPixel hardware details
 - `docs/obd-optimization.md` - OBD2 data rates and tweening
-- `docs/hardware.md` - Pi Zero 2W + HyperPixel setup
 
 ## Dependencies
 
