@@ -32,7 +32,8 @@
     "fps": 60,
     "smoothing": 0.25,
     "dial_background": "audi3",
-    "demo_mode": false
+    "demo_mode": false,
+    "animated_transitions": true
   },
   "obd": {
     "rate_hz": 25,

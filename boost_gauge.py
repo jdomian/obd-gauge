@@ -148,6 +148,21 @@ class BoostGaugeTest:
         self.row_cols = [4, 1, 1, 1]  # Number of columns per row
         self.num_rows = 4    # 4 rows (gauges + bluetooth + wifi/settings + system)
 
+        # Screen transition animation state
+        self._transition_state = 'idle'  # 'idle', 'dragging', 'animating'
+        self._transition_offset = 0.0    # Current pixel offset (-480 to 480)
+        self._transition_velocity = 0.0  # Pixels per second (for momentum)
+        self._transition_direction = None  # 'horizontal' or 'vertical'
+        self._transition_target_row = None
+        self._transition_target_col = None
+        self._transition_from_row = None
+        self._transition_from_col = None
+        self._transition_completing = True  # True = completing to target, False = snapping back
+        self._cached_screen = None       # Pygame Surface snapshot of current screen
+        self._incoming_screen = None     # Pygame Surface for destination screen
+        self._touch_history = []         # [(x, y, timestamp), ...] for velocity calc
+        self.animated_transitions = True # Can be disabled in settings
+
         # Brightness setting (10-100%)
         self.brightness = 100
         self.min_brightness = 10
@@ -323,8 +338,9 @@ class BoostGaugeTest:
                 self.smoothing = display.get("smoothing", 0.25)
                 self.demo_mode = display.get("demo_mode", True)
                 self.dial_background = display.get("dial_background", "default")
+                self.animated_transitions = display.get("animated_transitions", True)
 
-                print(f"[Settings] Display: fps={self.target_fps}, demo={self.demo_mode}, dial={self.dial_background}")
+                print(f"[Settings] Display: fps={self.target_fps}, demo={self.demo_mode}, dial={self.dial_background}, animated={self.animated_transitions}")
 
                 # Update row_cols based on number of gauges (+ shift light)
                 # Row 0: Gauges (+ shift light), Row 1: Bluetooth, Row 2: WiFi/Settings, Row 3: System
@@ -771,13 +787,19 @@ class BoostGaugeTest:
         self.client_check_thread.start()
 
     def _on_enter_bt_screen(self):
-        """Called when entering the Bluetooth screen."""
-        if MODULES_AVAILABLE:
-            try:
-                self.bt_status = get_bt_status()
-                print(f"BT Status: {self.bt_status}")
-            except Exception as e:
-                print(f"Failed to get BT status: {e}")
+        """Called when entering the Bluetooth screen - runs async to avoid blocking."""
+        def fetch_bt_status():
+            if MODULES_AVAILABLE:
+                try:
+                    status = get_bt_status()
+                    self.bt_status = status
+                    print(f"BT Status: {status}")
+                except Exception as e:
+                    print(f"Failed to get BT status: {e}")
+
+        # Run in background thread to prevent UI freeze
+        thread = threading.Thread(target=fetch_bt_status, daemon=True)
+        thread.start()
 
     def _start_bt_scan(self):
         """Start Bluetooth device scan in background thread."""
@@ -823,99 +845,181 @@ class BoostGaugeTest:
             gfxdraw.filled_circle(self._dim_overlay, 240, 240, 240, (0, 0, 0, alpha))
 
     def handle_touch(self, x, y, state):
-        """Handle raw touch events from hyperpixel2r library."""
+        """Handle raw touch events from hyperpixel2r library with animated transitions."""
+        SWIPE_THRESHOLD = 30  # Lower threshold for direction detection during drag
+        DIRECTION_LOCK_THRESHOLD = 15  # Distance before locking direction
+
         if state:  # Touch down / drag
-            # Only set start on FIRST touch (not during drag)
+            # Touch start
             if not hasattr(self, '_touch_start_x') or self._touch_start_x is None:
                 self._touch_start_x = x
                 self._touch_start_y = y
                 self._touch_start_time = time.time()
-            # Always track current position
+                self._touch_history = [(x, y, time.time())]
+
+                # Handle animation interruption - if user touches during animation,
+                # immediately complete or cancel the current animation
+                if self.animated_transitions and self._transition_state == 'animating':
+                    # If we were completing a transition (going to target), finish it
+                    # If we were snapping back (cancelled), cancel it
+                    if getattr(self, '_transition_completing', True):
+                        # Complete the transition instantly
+                        self._finalize_transition()
+                        # Re-render the target screen to update the display buffer
+                        # (otherwise _cached_screen would have transition graphics)
+                        self._render_current_screen_to_buffer()
+                    else:
+                        # Was snapping back - just cancel
+                        self._cancel_transition()
+
+                # Now prepare for potential new transition
+                if self.animated_transitions and self._transition_state == 'idle':
+                    # Capture current screen for potential transition
+                    self._cached_screen = self.screen.copy()
+                    self._transition_direction = None  # Not yet determined
+
+            # Track current position
             self._touch_current_x = x
             self._touch_current_y = y
 
-            # Handle drag on brightness slider (row 2)
-            if self.screen_row == 2:
+            # Add to touch history for velocity calculation
+            self._touch_history.append((x, y, time.time()))
+            if len(self._touch_history) > 8:
+                self._touch_history.pop(0)
+
+            # Calculate drag distance
+            dx = x - self._touch_start_x
+            dy = y - self._touch_start_y
+
+            # Handle brightness slider drag (only when not in transition)
+            if self.screen_row == 3 and self._transition_state == 'idle':
                 self._handle_brightness_drag(x, y)
+
+            # Animated transition dragging
+            if self.animated_transitions and self._cached_screen is not None:
+                # Determine direction once we've moved enough
+                if self._transition_direction is None and (abs(dx) > DIRECTION_LOCK_THRESHOLD or abs(dy) > DIRECTION_LOCK_THRESHOLD):
+                    if abs(dx) > abs(dy):
+                        # Horizontal - check if we can navigate
+                        num_cols = self.row_cols[self.screen_row]
+                        if num_cols > 1:
+                            self._transition_direction = 'horizontal'
+                            # Determine target column
+                            if dx < 0:  # Swiping left = next column
+                                target_col = (self.screen_col + 1) % num_cols
+                            else:  # Swiping right = prev column
+                                target_col = (self.screen_col - 1) % num_cols
+                            self._transition_target_col = target_col
+                            self._transition_target_row = self.screen_row
+                            self._transition_from_row = self.screen_row
+                            self._transition_from_col = self.screen_col
+                            self._incoming_screen = self._render_screen_to_surface(self.screen_row, target_col)
+                            self._transition_state = 'dragging'
+                    else:
+                        # Vertical - check if we can navigate
+                        if dy < 0 and self.screen_row < self.num_rows - 1:
+                            # Swiping up = next row
+                            self._transition_direction = 'vertical'
+                            target_row = self.screen_row + 1
+                            target_col = min(self.screen_col, self.row_cols[target_row] - 1)
+                            self._transition_target_row = target_row
+                            self._transition_target_col = target_col
+                            self._transition_from_row = self.screen_row
+                            self._transition_from_col = self.screen_col
+                            self._incoming_screen = self._render_screen_to_surface(target_row, target_col)
+                            self._transition_state = 'dragging'
+                        elif dy > 0 and self.screen_row > 0:
+                            # Swiping down = prev row
+                            self._transition_direction = 'vertical'
+                            target_row = self.screen_row - 1
+                            target_col = min(self.screen_col, self.row_cols[target_row] - 1)
+                            self._transition_target_row = target_row
+                            self._transition_target_col = target_col
+                            self._transition_from_row = self.screen_row
+                            self._transition_from_col = self.screen_col
+                            self._incoming_screen = self._render_screen_to_surface(target_row, target_col)
+                            self._transition_state = 'dragging'
+
+                # Update transition offset based on drag
+                if self._transition_state == 'dragging':
+                    if self._transition_direction == 'horizontal':
+                        self._transition_offset = dx
+                        # Clamp to prevent over-scrolling
+                        self._transition_offset = max(-480, min(480, self._transition_offset))
+                    else:  # vertical
+                        self._transition_offset = dy
+                        self._transition_offset = max(-480, min(480, self._transition_offset))
+
         else:  # Touch up
             if hasattr(self, '_touch_start_x') and self._touch_start_x is not None:
                 dx = self._touch_current_x - self._touch_start_x
                 dy = self._touch_current_y - self._touch_start_y
                 duration = (time.time() - self._touch_start_time) * 1000
 
-                SWIPE_THRESHOLD = 50
-                old_row = self.screen_row
-                old_col = self.screen_col
+                # Handle transition release
+                if self._transition_state == 'dragging':
+                    # Calculate release velocity
+                    velocity = self._calculate_release_velocity()
 
-                # Determine if horizontal or vertical swipe
-                if abs(dx) > abs(dy) and abs(dx) > SWIPE_THRESHOLD:
-                    # Horizontal swipe - navigate columns within current row
-                    num_cols = self.row_cols[self.screen_row]
-                    if num_cols > 1:
-                        if dx < 0:  # Swipe left = next column
-                            new_col = (self.screen_col + 1) % num_cols
-                        else:  # Swipe right = prev column
-                            new_col = (self.screen_col - 1) % num_cols
+                    # Decide: complete transition or snap back
+                    # Complete if: moved more than 25% OR velocity is high enough in swipe direction
+                    offset_pct = abs(self._transition_offset) / 480
+                    velocity_threshold = 400  # pixels per second
 
-                        # Handle screen transitions for row 1
-                        if self.screen_row == 1:
-                            # Leaving QR screen (col 0)
-                            if self.screen_col == 0 and new_col != 0:
-                                self._on_exit_qr_screen()
-                            # Entering QR screen (col 0)
-                            if new_col == 0 and self.screen_col != 0:
-                                self._on_enter_qr_screen()
-                            # Entering BT screen (col 1)
-                            if new_col == 1 and self.screen_col != 1:
-                                self._on_enter_bt_screen()
+                    # Check if velocity is in the "correct" direction for completing
+                    velocity_helps = (self._transition_offset < 0 and velocity < -velocity_threshold) or \
+                                   (self._transition_offset > 0 and velocity > velocity_threshold)
 
-                        self.screen_col = new_col
-                        print(f"SWIPE {'LEFT' if dx < 0 else 'RIGHT'} -> Row {self.screen_row}, Col {self.screen_col}")
+                    if offset_pct > 0.25 or velocity_helps:
+                        # Complete the transition
+                        self._transition_completing = True
+                        self._transition_state = 'animating'
+                        self._transition_start_time = time.time()  # Reset timeout
+                        self._transition_velocity = velocity  # Use actual release velocity
+                        print(f"Completing transition (offset={offset_pct*100:.0f}%, vel={velocity:.0f})")
+                    else:
+                        # Snap back to original
+                        self._transition_completing = False
+                        self._transition_state = 'animating'
+                        self._transition_start_time = time.time()  # Reset timeout
+                        self._transition_velocity = velocity  # Use actual release velocity
+                        print(f"Snapping back (offset={offset_pct*100:.0f}%, vel={velocity:.0f})")
 
-                elif abs(dy) > abs(dx) and abs(dy) > SWIPE_THRESHOLD:
-                    # Vertical swipe - navigate rows
-                    if dy < 0:  # Swipe up = go to next row
-                        if self.screen_row < self.num_rows - 1:
-                            new_row = self.screen_row + 1
-                            # Handle transitions
-                            if self.screen_row == 1 and self.screen_col == 0:
-                                self._on_exit_qr_screen()
-                            self.screen_row = new_row
-                            # Clamp column to valid range for new row
-                            self.screen_col = min(self.screen_col, self.row_cols[new_row] - 1)
-                            # Handle entering new row
-                            if new_row == 1 and self.screen_col == 0:
-                                self._on_enter_qr_screen()
-                            elif new_row == 1 and self.screen_col == 1:
-                                self._on_enter_bt_screen()
-                            # Set cooldown to prevent accidental taps after navigation
-                            self._nav_cooldown = time.time() + 0.5  # 500ms cooldown
-                            print(f"SWIPE UP -> Row {self.screen_row}, Col {self.screen_col}")
-                    else:  # Swipe down = go to prev row
-                        if self.screen_row > 0:
-                            new_row = self.screen_row - 1
-                            # Handle transitions
-                            if self.screen_row == 1 and self.screen_col == 0:
-                                self._on_exit_qr_screen()
-                            self.screen_row = new_row
-                            # Clamp column to valid range for new row
-                            self.screen_col = min(self.screen_col, self.row_cols[new_row] - 1)
-                            # Handle entering new row
-                            if new_row == 1 and self.screen_col == 0:
-                                self._on_enter_qr_screen()
-                            elif new_row == 1 and self.screen_col == 1:
-                                self._on_enter_bt_screen()
-                            # Set cooldown to prevent accidental taps after navigation
-                            self._nav_cooldown = time.time() + 0.5  # 500ms cooldown
-                            print(f"SWIPE DOWN -> Row {self.screen_row}, Col {self.screen_col}")
-
+                # Handle tap (small movement, short duration, not transitioning)
                 elif abs(dx) < 20 and abs(dy) < 20 and duration < 300:
-                    # Tap detected
                     print(f"TAP detected at ({x}, {y}) on Row {self.screen_row}, Col {self.screen_col}")
                     self._handle_tap(x, y)
+                    # Clean up any cached screen
+                    self._cached_screen = None
+                    self._incoming_screen = None
+
+                # Non-animated swipe fallback (if animations disabled)
+                elif not self.animated_transitions:
+                    if abs(dx) > abs(dy) and abs(dx) > SWIPE_THRESHOLD:
+                        # Horizontal swipe
+                        num_cols = self.row_cols[self.screen_row]
+                        if num_cols > 1:
+                            if dx < 0:
+                                new_col = (self.screen_col + 1) % num_cols
+                            else:
+                                new_col = (self.screen_col - 1) % num_cols
+                            self.screen_col = new_col
+                            print(f"SWIPE {'LEFT' if dx < 0 else 'RIGHT'} -> Row {self.screen_row}, Col {self.screen_col}")
+                    elif abs(dy) > abs(dx) and abs(dy) > SWIPE_THRESHOLD:
+                        # Vertical swipe
+                        if dy < 0 and self.screen_row < self.num_rows - 1:
+                            self.screen_row += 1
+                            self.screen_col = min(self.screen_col, self.row_cols[self.screen_row] - 1)
+                            print(f"SWIPE UP -> Row {self.screen_row}, Col {self.screen_col}")
+                        elif dy > 0 and self.screen_row > 0:
+                            self.screen_row -= 1
+                            self.screen_col = min(self.screen_col, self.row_cols[self.screen_row] - 1)
+                            print(f"SWIPE DOWN -> Row {self.screen_row}, Col {self.screen_col}")
                 else:
-                    # No gesture matched
-                    print(f"NO GESTURE: dx={dx:.1f}, dy={dy:.1f}, dur={duration:.0f}ms")
+                    # Small movement but not a tap - clean up
+                    self._cached_screen = None
+                    self._incoming_screen = None
+                    self._transition_state = 'idle'
 
             # Reset for next gesture
             self._touch_start_x = None
@@ -938,17 +1042,7 @@ class BoostGaugeTest:
 
     def _handle_tap(self, x, y):
         """Handle tap gesture - context-dependent actions."""
-        if self.screen_row == 1 and self.screen_col == 0:
-            # QR Settings screen - tap to toggle hotspot
-            if 150 < y < 350:
-                # Tap on center area toggles hotspot
-                if not self.hotspot_active and not self.hotspot_starting:
-                    print("Tap -> Starting hotspot...")
-                    self._start_hotspot_async()
-                elif self.hotspot_active and not self.hotspot_stopping:
-                    print("Tap -> Stopping hotspot...")
-                    self._stop_hotspot_async()
-        elif self.screen_row == 1 and self.screen_col == 1:
+        if self.screen_row == 1:
             # Bluetooth screen - tap zones for SCAN and PAIR/DISCONNECT
             # Reset disconnect confirm if tapping elsewhere
             if y <= 310 or x < 240:
@@ -992,6 +1086,16 @@ class BoostGaugeTest:
                     self.bt_selected_device = idx
                     print(f"Selected device: {self.bt_devices[idx].name} ({self.bt_devices[idx].mac})")
         elif self.screen_row == 2:
+            # WiFi/QR Settings screen - tap to toggle hotspot
+            if 150 < y < 350:
+                # Tap on center area toggles hotspot
+                if not self.hotspot_active and not self.hotspot_starting:
+                    print("Tap -> Starting hotspot...")
+                    self._start_hotspot_async()
+                elif self.hotspot_active and not self.hotspot_stopping:
+                    print("Tap -> Stopping hotspot...")
+                    self._stop_hotspot_async()
+        elif self.screen_row == 3:
             # System screen - demo toggle, brightness slider, or power buttons
             if y >= 80 and y <= 140:
                 # Demo mode toggle area (top)
@@ -1043,6 +1147,237 @@ class BoostGaugeTest:
         # Set pending action and stop main loop - action executed after clean exit
         self._pending_action = 'reboot'
         self._running = False
+
+    # ==================== Screen Transition Animation ====================
+
+    def _start_transition(self, direction, target_row, target_col):
+        """Begin a screen transition animation."""
+        if not self.animated_transitions:
+            # Instant transition (old behavior)
+            self.screen_row = target_row
+            self.screen_col = target_col
+            return
+
+        self._transition_state = 'dragging'
+        self._transition_direction = direction
+        self._transition_from_row = self.screen_row
+        self._transition_from_col = self.screen_col
+        self._transition_target_row = target_row
+        self._transition_target_col = target_col
+        self._transition_offset = 0.0
+        self._transition_velocity = 0.0
+        self._touch_history = []
+
+        # Capture current screen
+        self._cached_screen = self.screen.copy()
+
+        # Pre-render the incoming screen
+        self._incoming_screen = self._render_screen_to_surface(target_row, target_col)
+
+    def _render_screen_to_surface(self, row, col):
+        """Render a specific screen to an off-screen surface."""
+        # Create temporary surface
+        temp_surface = pygame.Surface((480, 480))
+        temp_surface.fill(self.BLACK)
+
+        # Save current screen reference and swap in temp
+        original_screen = self.screen
+        self.screen = temp_surface
+
+        # Save current row/col
+        orig_row, orig_col = self.screen_row, self.screen_col
+        self.screen_row, self.screen_col = row, col
+
+        # Render the target screen
+        if row == 0:
+            if col < len(self.gauge_configs):
+                gauge = self.gauge_configs[col]
+                self._draw_configured_gauge(gauge)
+            elif col == len(self.gauge_configs):
+                self._draw_shift_light_screen()
+        elif row == 1:
+            self._draw_bluetooth_screen()
+        elif row == 2:
+            self._draw_qr_settings_screen()
+        elif row == 3:
+            self._draw_brightness_screen()
+
+        # Restore original screen and position
+        self.screen = original_screen
+        self.screen_row, self.screen_col = orig_row, orig_col
+
+        return temp_surface
+
+    def _render_current_screen_to_buffer(self):
+        """Render the current screen directly to self.screen buffer.
+
+        Used after force-completing a transition to update the display buffer
+        with the correct screen content before capturing for next transition.
+        """
+        self.screen.fill(self.BLACK)
+        if self.screen_row == 0:
+            if self.screen_col < len(self.gauge_configs):
+                gauge = self.gauge_configs[self.screen_col]
+                self._draw_configured_gauge(gauge)
+            elif self.screen_col == len(self.gauge_configs):
+                self._draw_shift_light_screen()
+        elif self.screen_row == 1:
+            self._draw_bluetooth_screen()
+        elif self.screen_row == 2:
+            self._draw_qr_settings_screen()
+        elif self.screen_row == 3:
+            self._draw_brightness_screen()
+
+    def _update_transition_animation(self, dt):
+        """Update transition animation (called each frame when animating)."""
+        if self._transition_state != 'animating':
+            return
+
+        # Safety timeout - if animation has been running too long, force complete
+        if not hasattr(self, '_transition_start_time'):
+            self._transition_start_time = time.time()
+        elif time.time() - self._transition_start_time > 0.5:  # 500ms max
+            print("Animation timeout - forcing completion")
+            if getattr(self, '_transition_completing', True):
+                self._finalize_transition()
+            else:
+                self._cancel_transition()
+            return
+
+        # Determine target based on whether we're completing or snapping back
+        if getattr(self, '_transition_completing', True):
+            # Completing - figure out which direction
+            going_forward = False
+            if self._transition_direction == 'horizontal':
+                if self._transition_target_col > self._transition_from_col or \
+                   (self._transition_from_col == self.row_cols[self.screen_row] - 1 and self._transition_target_col == 0):
+                    going_forward = True
+            else:  # vertical
+                if self._transition_target_row > self._transition_from_row:
+                    going_forward = True
+            target_offset = -480.0 if going_forward else 480.0
+        else:
+            # Snapping back to origin
+            target_offset = 0.0
+
+        distance_to_target = target_offset - self._transition_offset
+
+        # When close to target, use smooth exponential ease-out (no bump)
+        # This eliminates the jarring snap at the end
+        if abs(distance_to_target) < 25 and abs(self._transition_velocity) < 300:
+            # Exponential ease-out: smoothly approach target without overshoot
+            # Move a percentage of remaining distance, frame-rate adjusted
+            approach_speed = 18.0  # Higher = faster final approach
+            move_amount = distance_to_target * min(1.0, approach_speed * dt)
+            self._transition_offset += move_amount
+            self._transition_velocity *= 0.7  # Decay any remaining velocity
+
+            # Complete when imperceptibly close (< 1.5 pixels)
+            if abs(target_offset - self._transition_offset) < 1.5:
+                if getattr(self, '_transition_completing', True):
+                    self._finalize_transition()
+                else:
+                    self._cancel_transition()
+            return
+
+        # Use spring physics for main animation (fast, responsive)
+        spring_strength = 120.0
+        damping = 22.0
+
+        # Apply spring force + damping
+        acceleration = distance_to_target * spring_strength - self._transition_velocity * damping
+        self._transition_velocity += acceleration * dt
+        self._transition_offset += self._transition_velocity * dt
+
+        # Clamp offset to valid range
+        self._transition_offset = max(-490, min(490, self._transition_offset))
+
+    def _finalize_transition(self):
+        """Complete the transition - update row/col, clear state."""
+        # Handle screen exit callbacks
+        if self._transition_from_row == 2:  # Leaving WiFi/QR screen
+            self._on_exit_qr_screen()
+
+        # Update position
+        self.screen_row = self._transition_target_row
+        self.screen_col = self._transition_target_col
+
+        # Handle screen enter callbacks
+        if self.screen_row == 2:  # Entering WiFi/QR screen
+            self._on_enter_qr_screen()
+        elif self.screen_row == 1:  # Entering Bluetooth screen
+            self._on_enter_bt_screen()
+
+        # Reset state
+        self._transition_state = 'idle'
+        self._transition_offset = 0.0
+        self._transition_velocity = 0.0
+        self._transition_start_time = None  # Clear timeout
+        self._cached_screen = None
+        self._incoming_screen = None
+        self._touch_history = []
+
+        # Set cooldown to prevent accidental taps
+        self._nav_cooldown = time.time() + 0.3
+
+        print(f"Transition complete -> Row {self.screen_row}, Col {self.screen_col}")
+
+    def _cancel_transition(self):
+        """Snap back to original screen (transition cancelled)."""
+        self._transition_state = 'idle'
+        self._transition_offset = 0.0
+        self._transition_start_time = None  # Clear timeout
+        self._transition_velocity = 0.0
+        self._cached_screen = None
+        self._incoming_screen = None
+        self._touch_history = []
+        print("Transition cancelled - snapped back")
+
+    def _draw_transition(self):
+        """Draw the transition animation (two screens sliding)."""
+        if self._cached_screen is None or self._incoming_screen is None:
+            return
+
+        offset = int(self._transition_offset)
+
+        if self._transition_direction == 'horizontal':
+            # Horizontal slide
+            self.screen.blit(self._cached_screen, (offset, 0))
+            if offset < 0:
+                # Swiping left - incoming comes from right
+                self.screen.blit(self._incoming_screen, (480 + offset, 0))
+            else:
+                # Swiping right - incoming comes from left
+                self.screen.blit(self._incoming_screen, (-480 + offset, 0))
+        else:
+            # Vertical slide
+            self.screen.blit(self._cached_screen, (0, offset))
+            if offset < 0:
+                # Swiping up - incoming comes from bottom
+                self.screen.blit(self._incoming_screen, (0, 480 + offset))
+            else:
+                # Swiping down - incoming comes from top
+                self.screen.blit(self._incoming_screen, (0, -480 + offset))
+
+    def _calculate_release_velocity(self):
+        """Calculate velocity at touch release from recent touch history."""
+        if len(self._touch_history) < 2:
+            return 0.0
+
+        # Use first and last points for velocity
+        p1 = self._touch_history[0]
+        p2 = self._touch_history[-1]
+        dt = p2[2] - p1[2]
+
+        if dt <= 0:
+            return 0.0
+
+        if self._transition_direction == 'horizontal':
+            return (p2[0] - p1[0]) / dt  # pixels per second
+        else:
+            return (p2[1] - p1[1]) / dt
+
+    # ==================== End Screen Transition Animation ====================
 
     def _exit(self, sig, frame):
         self._running = False
@@ -2281,28 +2616,37 @@ class BoostGaugeTest:
             self._update_value('coolant_temp', self.coolant_target, dt)
             self._update_value('engine_load', self.engine_load_target, dt)
 
+            # Update transition animation if active
+            if self._transition_state == 'animating':
+                self._update_transition_animation(dt)
+
             # Clear screen
             self.screen.fill(self.BLACK)
 
-            # Draw based on 2D grid position
-            if self.screen_row == 0:
-                # Row 0: Gauge screens (dynamically from gauge_configs)
-                if self.screen_col < len(self.gauge_configs):
-                    # Draw configured gauge
-                    gauge = self.gauge_configs[self.screen_col]
-                    self._draw_configured_gauge(gauge)
-                elif self.screen_col == len(self.gauge_configs):
-                    # Shift light is always last (full-screen peripheral vision indicator)
-                    self._draw_shift_light_screen()
-            elif self.screen_row == 1:
-                # Row 1: Bluetooth screen (only)
-                self._draw_bluetooth_screen()
-            elif self.screen_row == 2:
-                # Row 2: WiFi/Settings/QR screen
-                self._draw_qr_settings_screen()
-            elif self.screen_row == 3:
-                # Row 3: System screen (Brightness/Reboot/Restart)
-                self._draw_brightness_screen()
+            # Draw based on transition state or normal rendering
+            if self._transition_state in ('dragging', 'animating'):
+                # Draw transition animation (two screens sliding)
+                self._draw_transition()
+            else:
+                # Normal single-screen rendering
+                if self.screen_row == 0:
+                    # Row 0: Gauge screens (dynamically from gauge_configs)
+                    if self.screen_col < len(self.gauge_configs):
+                        # Draw configured gauge
+                        gauge = self.gauge_configs[self.screen_col]
+                        self._draw_configured_gauge(gauge)
+                    elif self.screen_col == len(self.gauge_configs):
+                        # Shift light is always last (full-screen peripheral vision indicator)
+                        self._draw_shift_light_screen()
+                elif self.screen_row == 1:
+                    # Row 1: Bluetooth screen (only)
+                    self._draw_bluetooth_screen()
+                elif self.screen_row == 2:
+                    # Row 2: WiFi/Settings/QR screen
+                    self._draw_qr_settings_screen()
+                elif self.screen_row == 3:
+                    # Row 3: System screen (Brightness/Reboot/Restart)
+                    self._draw_brightness_screen()
 
             self._draw_fps()
             self._draw_screen_indicator()
