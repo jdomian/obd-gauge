@@ -31,7 +31,7 @@
   ],
   "display": {
     "fps": 60,
-    "smoothing": 0.25,
+    "smoothing": 0,
     "dial_background": "audi",
     "demo_mode": false,
     "animated_transitions": true

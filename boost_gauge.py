@@ -315,6 +315,7 @@ class BoostGaugeTest:
         self.target_fps = 30
         self.demo_mode = True
         self.dial_background = "default"
+        self.obd_rate_hz = 25  # OBD polling rate default
 
         try:
             if os.path.exists(self._settings_path):
@@ -351,6 +352,10 @@ class BoostGaugeTest:
                 self.animated_transitions = display.get("animated_transitions", True)
 
                 print(f"[Settings] Display: fps={self.target_fps}, demo={self.demo_mode}, dial={self.dial_background}, animated={self.animated_transitions}")
+
+                # Load OBD settings
+                obd = settings.get("obd", {})
+                self.obd_rate_hz = obd.get("rate_hz", 25)
 
                 # Update row_cols based on number of gauges (+ shift light)
                 # Row 0: Gauges (+ shift light), Row 1: Bluetooth, Row 2: WiFi/Settings, Row 3: System
@@ -1836,16 +1841,43 @@ class BoostGaugeTest:
             self._smoothed_values[smooth_key] = target
 
         current = self._smoothed_values[smooth_key]
+
+        # Get or initialize velocity
+        vel_key = f"{pid}_velocity"
+        if vel_key not in self._smoothed_values:
+            self._smoothed_values[vel_key] = 0.0
+        velocity = self._smoothed_values[vel_key]
+
         diff = target - current
 
-        # Fast, responsive smoothing (0.5 = very responsive)
-        smooth_factor = 0.5
-        ease = 1.0 - math.pow(1.0 - smooth_factor, dt * 60)
-        value = current + diff * ease
+        # Physics for smooth motion, but NEVER overshoot
+        spring = 195.0  # Stronger = more responsive
 
-        # Snap if very close
-        if abs(diff) < 0.1:
+        # Accelerate toward target
+        velocity += diff * spring * dt
+
+        # Apply damping (lower = less bouncy)
+        velocity *= 0.72
+
+        # Calculate proposed new position
+        proposed = current + velocity * dt
+
+        # CRITICAL: Never overshoot - if we would pass target, stop AT target
+        if diff > 0:  # Moving up
+            value = min(proposed, target)
+            if proposed >= target:
+                velocity = 0  # Stop at target
+        else:  # Moving down
+            value = max(proposed, target)
+            if proposed <= target:
+                velocity = 0  # Stop at target
+
+        # Snap when very close
+        if abs(target - value) < 0.3:
             value = target
+            velocity = 0
+
+        self._smoothed_values[vel_key] = velocity
 
         # Store smoothed value for next frame
         self._smoothed_values[smooth_key] = value
@@ -2570,11 +2602,14 @@ class BoostGaugeTest:
             self.obd_connection.set_state_callback(self._obd_state_callback)
             self.obd_connection.set_data_callback(self._obd_data_callback)
 
-            if self.obd_connection.connect():
-                # Start polling at configured rate (default 25 Hz)
-                obd_rate = self.settings.get("obd", {}).get("rate_hz", 25)
-                self.obd_connection.start_polling(rate_hz=obd_rate)
-                print(f"[OBD] Polling at {obd_rate} Hz")
+            connect_result = self.obd_connection.connect()
+            # Debug: write connect result to file
+            with open('/tmp/obd-debug.txt', 'a') as f:
+                f.write(f"connect() returned: {connect_result}\n")
+            if connect_result:
+                # Start polling at configured rate
+                self.obd_connection.start_polling(rate_hz=self.obd_rate_hz)
+                print(f"[OBD] Polling at {self.obd_rate_hz} Hz")
                 # Set active PID based on current visible gauge
                 self._update_active_pid()
                 # Turn off demo mode when connected

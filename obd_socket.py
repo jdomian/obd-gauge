@@ -28,9 +28,15 @@ from typing import Optional, Callable, Dict, List, Any, Union
 from dataclasses import dataclass
 from enum import Enum
 
-# Configure logging
+# Configure logging - also write to file for debugging
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
+
+# Add file handler for debugging
+_fh = logging.FileHandler('/tmp/obd-gauge.log')
+_fh.setLevel(logging.DEBUG)
+_fh.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+logger.addHandler(_fh)
 
 
 class ConnectionState(Enum):
@@ -77,11 +83,13 @@ class OBDSocket:
     ]
 
     # STN2255 extended commands (OBDLink MX+ specific)
-    # These are tried after basic init, errors are ignored for ELM327 adapters
+    # DISABLED: These flow control commands break communication with Audi RS7 ECU
+    # The ECU returns "NO DATA" after STFCP/STFAC/FC SD commands are sent
+    # Keeping standard ELM327 mode which works reliably
     STN_COMMANDS = [
-        ("STFCP", 0.3),           # Fast CAN polling mode
-        ("STFAC", 0.3),           # Fast CAN auto-format
-        ("AT FC SD 30 00 00", 0.3),  # Flow Control: no delay between frames
+        # ("STFCP", 0.3),           # Fast CAN polling mode - BREAKS AUDI
+        # ("STFAC", 0.3),           # Fast CAN auto-format - BREAKS AUDI
+        # ("AT FC SD 30 00 00", 0.3),  # Flow Control - BREAKS AUDI
     ]
 
     # OBD-II PID definitions (Mode 01)
@@ -93,6 +101,8 @@ class OBDSocket:
         "010D": (1, "VSS", lambda x: x[0]),  # Vehicle Speed (km/h)
         "010F": (1, "IAT", lambda x: x[0] - 40),  # Intake Air Temp (C)
         "0111": (1, "TPS", lambda x: x[0] * 100 // 255),  # Throttle Position (%)
+        "0149": (1, "APP_D", lambda x: x[0] * 100 // 255),  # Accelerator Pedal Position D (%)
+        "014A": (1, "APP_E", lambda x: x[0] * 100 // 255),  # Accelerator Pedal Position E (%)
     }
 
     # Atmospheric pressure baseline for boost calculation
@@ -379,6 +389,10 @@ class OBDSocket:
         if not response:
             return None
 
+        # Debug throttle/accelerator PIDs
+        if pid in ("0111", "0149", "014A") and hasattr(self, '_dbg_count') and self._dbg_count % 60 == 0:
+            logger.info(f"[OBD] Raw {pid} response: '{response}'")
+
         return self._parse_pid_response(pid, response)
 
     def _parse_pid_response(self, pid: str, response: str) -> Optional[Any]:
@@ -481,7 +495,7 @@ class OBDSocket:
 
 
     def set_active_pid(self, pid: str):
-        """Set which PID to poll in fast mode. Only polls one PID for max speed."""
+        """Set which PID to poll in fast mode (for future use)."""
         self._active_pid = pid
         logger.info(f"Active PID set to: {pid}")
 
@@ -509,6 +523,7 @@ class OBDSocket:
             elif pid == '010F':  # Intake air temp
                 self.data.intake_temp_c = result
 
+        self.data.timestamp = time.time()
         return self.data
     def start_polling(self, rate_hz: float = 10.0):
         """
@@ -533,12 +548,16 @@ class OBDSocket:
         )
         self._polling_thread.start()
         logger.info(f"Started OBD polling at {rate_hz} Hz")
+        # Direct file write for debugging
+        with open('/tmp/obd-debug.txt', 'a') as f:
+            f.write(f"start_polling called at {rate_hz} Hz\n")
 
     def _polling_loop(self, rate_hz: float):
         """Background polling loop"""
         interval = 1.0 / rate_hz
         error_count = 0
         max_errors = 5
+        logger.info(f"[OBD] Entering polling loop at {rate_hz} Hz")
 
         while not self._stop_polling.is_set():
             start = time.time()
