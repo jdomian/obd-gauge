@@ -480,38 +480,35 @@ class OBDSocket:
         return self.data
 
 
+    def set_active_pid(self, pid: str):
+        """Set which PID to poll in fast mode. Only polls one PID for max speed."""
+        self._active_pid = pid
+        logger.info(f"Active PID set to: {pid}")
+
     def query_fast(self) -> OBDData:
-        """Query single PIDs with throttle prioritized for responsiveness.
-        
-        Pattern: Throttle -> Throttle -> MAP -> Throttle -> Throttle -> RPM
-        This gives throttle 4x more updates than boost/RPM.
+        """Query only the active PID for maximum speed.
+
+        Only polls whichever gauge is currently visible on screen.
+        Call set_active_pid() when user swipes to different gauge.
         """
-        # Prioritize throttle: T T M T T R (throttle gets 4/6 = 67% of queries)
-        pids = [
-            ('0111', 'throttle_pos'),  # Throttle
-            ('0111', 'throttle_pos'),  # Throttle again
-            ('010B', 'map_kpa'),        # MAP for boost
-            ('0111', 'throttle_pos'),  # Throttle
-            ('0111', 'throttle_pos'),  # Throttle again  
-            ('010C', 'rpm'),            # RPM
-        ]
-        
-        # Rotate through PIDs
-        self._fast_pid_idx = getattr(self, '_fast_pid_idx', 0)
-        pid_code, attr = pids[self._fast_pid_idx]
-        self._fast_pid_idx = (self._fast_pid_idx + 1) % len(pids)
-        
-        result = self.query_pid(pid_code, fast=True)
+        # Get active PID (default to throttle)
+        pid = getattr(self, '_active_pid', '0111')
+
+        result = self.query_pid(pid, fast=True)
         if result is not None:
-            if attr == 'throttle_pos':
+            if pid == '0111':  # Throttle
                 self.data.throttle_pos = result
-            elif attr == 'map_kpa':
+            elif pid == '010B':  # MAP/Boost
                 self.data.map_kpa = result
-                boost_kpa = result - 101.325
-                self.data.boost_psi = boost_kpa * 0.145038
-            elif attr == 'rpm':
+                self.data.boost_psi = (result - 101.325) * 0.145038
+            elif pid == '0105':  # Coolant temp
+                self.data.coolant_temp_c = result
+                self.data.coolant_temp_f = result * 9/5 + 32
+            elif pid == '010C':  # RPM
                 self.data.rpm = result
-        
+            elif pid == '010F':  # Intake air temp
+                self.data.intake_temp_c = result
+
         return self.data
     def start_polling(self, rate_hz: float = 10.0):
         """

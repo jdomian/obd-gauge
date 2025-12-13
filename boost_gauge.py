@@ -1358,6 +1358,10 @@ class BoostGaugeTest:
         elif self.screen_row == 1:  # Entering Bluetooth screen
             self._on_enter_bt_screen()
 
+        # Update active PID when gauge changes (Row 0 = gauge carousel)
+        if self.screen_row == 0:
+            self._update_active_pid()
+
         # Reset state
         self._transition_state = 'idle'
         self._transition_offset = 0.0
@@ -1760,7 +1764,7 @@ class BoostGaugeTest:
                 display_color = color
                 break
 
-        text = f"{value:.0f}" if abs(value) >= 10 else f"{value:.1f}"
+        text = f"{value:.1f}"  # Always show 1 decimal place
         val_surface = self._font_medium.render(text, True, display_color)
         val_rect = val_surface.get_rect(center=(240, 330))
         self.screen.blit(val_surface, val_rect)
@@ -1987,7 +1991,7 @@ class BoostGaugeTest:
         gfxdraw.filled_circle(self.screen, center_x, center_y, 5, self.WHITE)
 
         # Value text below
-        val_text = f"{value:.0f}" if abs(value) >= 10 else f"{value:.1f}"
+        val_text = f"{value:.1f}"  # Always show 1 decimal place
         val_surface = self._font_small.render(f"{val_text} {unit}", True, self.WHITE)
         val_rect = val_surface.get_rect(center=(center_x, center_y + radius + 15))
         self.screen.blit(val_surface, val_rect)
@@ -2571,6 +2575,8 @@ class BoostGaugeTest:
                 obd_rate = self.settings.get("obd", {}).get("rate_hz", 25)
                 self.obd_connection.start_polling(rate_hz=obd_rate)
                 print(f"[OBD] Polling at {obd_rate} Hz")
+                # Set active PID based on current visible gauge
+                self._update_active_pid()
                 # Turn off demo mode when connected
                 self.demo_mode = False
                 print("[OBD] Connected and polling started")
@@ -2584,6 +2590,33 @@ class BoostGaugeTest:
             self.obd_state = "error"
             self.obd_state_msg = str(e)[:30]
             self.obd_connection = None
+
+    def _update_active_pid(self):
+        """Update which PID the OBD poller focuses on based on visible gauge.
+
+        Only polls the PID for the currently visible gauge for maximum speed.
+        Called when: OBD connects, user swipes to different gauge.
+        """
+        if not self.obd_connection:
+            return
+
+        # Map gauge config PIDs to OBD PID codes
+        pid_map = {
+            "THROTTLE_POS": "0111",
+            "BOOST": "010B",
+            "COOLANT_TEMP": "0105",
+            "RPM": "010C",
+            "INTAKE_TEMP": "010F",
+            "ENGINE_LOAD": "0104",
+        }
+
+        # Get current gauge's PID (row 0, col = gauge index)
+        if self.screen_row == 0 and self.screen_col < len(self.gauge_configs):
+            gauge = self.gauge_configs[self.screen_col]
+            gauge_pid = gauge.get("pid", "THROTTLE_POS")
+            obd_pid = pid_map.get(gauge_pid, "0111")
+            self.obd_connection.set_active_pid(obd_pid)
+            print(f"[OBD] Active PID: {obd_pid} ({gauge_pid})")
 
     def connect_obd_socket(self, mac):
         """Connect to OBD adapter using socket-based approach (legacy wrapper)."""
