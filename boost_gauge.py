@@ -2567,8 +2567,10 @@ class BoostGaugeTest:
             self.obd_connection.set_data_callback(self._obd_data_callback)
 
             if self.obd_connection.connect():
-                # Start polling at 10 Hz
-                self.obd_connection.start_polling(rate_hz=10)
+                # Start polling at configured rate (default 25 Hz)
+                obd_rate = self.settings.get("obd", {}).get("rate_hz", 25)
+                self.obd_connection.start_polling(rate_hz=obd_rate)
+                print(f"[OBD] Polling at {obd_rate} Hz")
                 # Turn off demo mode when connected
                 self.demo_mode = False
                 print("[OBD] Connected and polling started")

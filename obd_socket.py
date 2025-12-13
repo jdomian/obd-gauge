@@ -76,6 +76,14 @@ class OBDSocket:
         ("ATSP6", 1.0),    # Force CAN 500 protocol (RS7)
     ]
 
+    # STN2255 extended commands (OBDLink MX+ specific)
+    # These are tried after basic init, errors are ignored for ELM327 adapters
+    STN_COMMANDS = [
+        ("STFCP", 0.3),           # Fast CAN polling mode
+        ("STFAC", 0.3),           # Fast CAN auto-format
+        ("AT FC SD 30 00 00", 0.3),  # Flow Control: no delay between frames
+    ]
+
     # OBD-II PID definitions (Mode 01)
     # Format: PID -> (bytes, name, parse_function)
     PIDS = {
@@ -249,6 +257,20 @@ class OBDSocket:
                 # Capture ELM version from ATZ response
                 if cmd == "ATZ" and "ELM327" in response:
                     self.elm_version = response.strip()
+
+            # Try STN2255 extended commands (OBDLink MX+ specific)
+            # These may fail on regular ELM327 adapters - that's OK
+            self._is_stn2255 = False
+            for cmd, timeout in self.STN_COMMANDS:
+                response = self._send_command(cmd, timeout)
+                if response and "?" not in response and "ERROR" not in response.upper():
+                    logger.info(f"STN2255 cmd OK: {cmd} -> {response}")
+                    self._is_stn2255 = True
+                else:
+                    logger.debug(f"STN2255 cmd not supported: {cmd}")
+
+            if self._is_stn2255:
+                logger.info("STN2255 adapter detected - fast polling enabled")
 
             # Verify communication with a simple PID query
             # Try to read supported PIDs
