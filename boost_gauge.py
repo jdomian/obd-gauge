@@ -25,6 +25,7 @@ import time
 import json
 import threading
 import subprocess
+import gc
 from touch import TouchHandler, GestureType
 
 # Import our new modules
@@ -59,12 +60,40 @@ except ImportError:
     print("Warning: qrcode[pil] library not installed. Run: pip install qrcode[pil]")
     QR_AVAILABLE = False
 
+
+def _reset_framebuffer():
+    """Reset framebuffer and VT for clean GPU state on startup.
+
+    This clears the framebuffer and triggers a VT switch which resets
+    the fbcon state, resulting in smoother animation performance.
+    """
+    try:
+        # Clear framebuffer to black (720 stride x 480 height x 2 bytes)
+        with open('/dev/fb0', 'wb') as fb:
+            fb.write(b'\x00' * (720 * 480 * 2))
+        print("[FB] Cleared framebuffer")
+
+        # VT switch to reset fbcon state
+        subprocess.run(['chvt', '1'], capture_output=True, timeout=2)
+        time.sleep(0.3)
+        subprocess.run(['chvt', '7'], capture_output=True, timeout=2)
+        time.sleep(0.2)
+        print("[FB] VT switch complete")
+    except Exception as e:
+        print(f"[FB] Reset skipped: {e}")
+
+
 class BoostGaugeTest:
     def __init__(self):
         self._dim_overlay = None  # Must init before first _flip
         self._init_display()
         self.screen.fill((0, 0, 0))
         self._flip()
+
+        # Disable automatic garbage collection - we'll run it manually during
+        # screen transitions when a brief pause won't affect animation smoothness
+        gc.disable()
+        print("[GC] Automatic garbage collection disabled")
 
         self.center = (240, 240)
         self._running = False
@@ -1381,6 +1410,9 @@ class BoostGaugeTest:
 
         print(f"Transition complete -> Row {self.screen_row}, Col {self.screen_col}")
 
+        # Run garbage collection now that surfaces are released
+        gc.collect()
+
     def _cancel_transition(self):
         """Snap back to original screen (transition cancelled)."""
         self._transition_state = 'idle'
@@ -1391,6 +1423,9 @@ class BoostGaugeTest:
         self._incoming_screen = None
         self._touch_history = []
         print("Transition cancelled - snapped back")
+
+        # Run garbage collection now that surfaces are released
+        gc.collect()
 
     def _draw_transition(self):
         """Draw the transition animation (two screens sliding)."""
@@ -1447,6 +1482,9 @@ class BoostGaugeTest:
         print("Goodbye!\n")
 
     def _init_display(self):
+        # Reset framebuffer for clean GPU state (fixes post-reboot sluggishness)
+        _reset_framebuffer()
+
         self._rawfb = False
 
         if os.getenv('SDL_VIDEODRIVER'):
