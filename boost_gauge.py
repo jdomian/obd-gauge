@@ -269,6 +269,7 @@ class BoostGaugeTest:
         }
 
         # Simulated values for live preview (keyed by PID id)
+        # These are the RAW target values from OBD (updated at OBD poll rate)
         self.simulated_values = {
             'BOOST': -10.0,
             'COOLANT_TEMP': 180.0,
@@ -279,6 +280,10 @@ class BoostGaugeTest:
             'OIL_TEMP': 210.0,
             'FUEL_PRESSURE': 45.0,
         }
+
+        # Smoothed values for needle animation (interpolated every frame)
+        # These smoothly track toward simulated_values for fluid needle movement
+        self._smoothed_values = dict(self.simulated_values)
 
         # Shift Light Settings (RS7 4.0T redline is ~6800, APR tune safe to 7000)
         self.shift_rpm_target = 6500   # When to shift (BRIGHT RED FLASH)
@@ -1789,11 +1794,12 @@ class BoostGaugeTest:
         ]
         self._draw_generic_gauge(load, 0, 100, "%", "ENGINE LOAD", color_zones)
 
-    def _draw_configured_gauge(self, gauge_config):
+    def _draw_configured_gauge(self, gauge_config, dt=0.016):
         """Draw a gauge based on configuration from settings.json.
 
         Args:
             gauge_config: Dict with keys: pid, label, min, max, conversion, color_preset
+            dt: Delta time since last frame (for smooth animation)
         """
         pid = gauge_config.get("pid", "BOOST")
         label = gauge_config.get("label", pid)
@@ -1801,22 +1807,44 @@ class BoostGaugeTest:
         max_val = gauge_config.get("max", 100)
         conversion = gauge_config.get("conversion", "none")
         color_preset = gauge_config.get("color_preset", "load")
+        offset = gauge_config.get("offset", 0)
 
-        # Get current value from simulated_values (updated by demo mode or OBD)
-        raw_value = self.simulated_values.get(pid, (min_val + max_val) / 2)
+        # Get TARGET value from simulated_values (updated by OBD at poll rate)
+        raw_target = self.simulated_values.get(pid, (min_val + max_val) / 2)
 
-        # Apply conversion if needed
+        # Apply conversion to target
         if conversion == "c_to_f":
-            # Celsius to Fahrenheit
-            value = raw_value * 9/5 + 32
+            target = raw_target * 9/5 + 32
         elif conversion == "kpa_to_psi":
-            # kPa to PSI (for boost)
-            value = raw_value * 0.145038
+            target = raw_target * 0.145038
         elif conversion == "bar_to_psi":
-            # Bar to PSI
-            value = raw_value * 14.5038
+            target = raw_target * 14.5038
         else:
-            value = raw_value
+            target = raw_target
+
+        # Apply calibration offset
+        target += offset
+
+        # SMOOTH the value for fluid needle animation
+        # Get current smoothed value (or initialize to target)
+        smooth_key = f"{pid}_smooth"
+        if smooth_key not in self._smoothed_values:
+            self._smoothed_values[smooth_key] = target
+
+        current = self._smoothed_values[smooth_key]
+        diff = target - current
+
+        # Fast, responsive smoothing (0.5 = very responsive)
+        smooth_factor = 0.5
+        ease = 1.0 - math.pow(1.0 - smooth_factor, dt * 60)
+        value = current + diff * ease
+
+        # Snap if very close
+        if abs(diff) < 0.1:
+            value = target
+
+        # Store smoothed value for next frame
+        self._smoothed_values[smooth_key] = value
 
         # Get color zones from preset
         color_zones = self.color_zone_presets.get(color_preset, self.color_zone_presets['load'])
@@ -1824,7 +1852,7 @@ class BoostGaugeTest:
         # Determine unit based on PID or config
         unit = self._get_unit_for_pid(pid, conversion)
 
-        # Draw the gauge
+        # Draw the gauge with smoothed value
         self._draw_generic_gauge(value, min_val, max_val, unit, label, color_zones)
 
     def _get_unit_for_pid(self, pid, conversion="none"):
@@ -2714,7 +2742,7 @@ class BoostGaugeTest:
                     if self.screen_col < len(self.gauge_configs):
                         # Draw configured gauge
                         gauge = self.gauge_configs[self.screen_col]
-                        self._draw_configured_gauge(gauge)
+                        self._draw_configured_gauge(gauge, dt)
                     elif self.screen_col == len(self.gauge_configs):
                         # Shift light is always last (full-screen peripheral vision indicator)
                         self._draw_shift_light_screen()

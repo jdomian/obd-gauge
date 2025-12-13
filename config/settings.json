@@ -14,7 +14,8 @@
       "pid": "COOLANT_TEMP",
       "label": "COOLANT",
       "needle": "audi3",
-      "conversion": "none",
+      "conversion": "c_to_f",
+      "offset": -10,
       "min": 100,
       "max": 260
     },
@@ -36,7 +37,7 @@
     "animated_transitions": true
   },
   "obd": {
-    "rate_hz": 25,
+    "rate_hz": 60,
     "bt_device_mac": "00:04:3E:88:EE:C0",
     "bt_device_name": "OBDLink MX+ 29398"
   },

@@ -252,7 +252,7 @@ The HyperPixel 2r has a **binary backlight** (on/off via GPIO) with no PWM dimmi
 - Touch uses `hyperpixel2r` library with `disable-touch` overlay for Python I2C access
 
 ### 2025-12-06
-- Removed Pi 5 / claude-portable leftovers (opencv, Pillow, psutil, camera config)
+- Removed Pi 5 / claude-zero leftovers (opencv, Pillow, psutil, camera config)
 - Deployed to claude-go (10.0.0.219)
 - Fixed auto-start: switched from systemd to rc.local (fbcon + systemd = SIGHUP issues)
 - Disabled getty@tty1 to prevent console interference
