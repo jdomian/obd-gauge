@@ -109,6 +109,7 @@ class BoostGaugeTest:
         self.YELLOW = (255, 255, 0)
         self.RED = (255, 0, 0)
         self.BLUE = (0, 150, 255)
+        self.CYAN = (0, 200, 200)  # Warming zone (between cold and normal)
         self.GOLD = (255, 215, 0)
 
         # Audi MMI Color Palette
@@ -245,8 +246,8 @@ class BoostGaugeTest:
         # Gauge data (simulated for now)
         self.boost_psi = -10.0
         self.boost_target = -10.0
-        self.coolant_temp = 180.0  # °F
-        self.coolant_target = 180.0
+        self.oil_temp = 100.0  # °F (start at min)
+        self.oil_temp_target = 100.0
         self.engine_load = 25.0  # %
         self.engine_load_target = 25.0
 
@@ -259,7 +260,7 @@ class BoostGaugeTest:
         # color_zones: list of (start_pct, end_pct, color_name)
         self.available_pids = [
             ('BOOST', 'Boost Pressure', 'PSI', -15, 25, 'boost'),
-            ('COOLANT_TEMP', 'Coolant Temp', '°F', 100, 260, 'temp'),
+            ('OIL_TEMP', 'Oil Temp', '°F', 100, 260, 'temp'),
             ('ENGINE_LOAD', 'Engine Load', '%', 0, 100, 'load'),
             ('INTAKE_TEMP', 'Intake Air Temp', '°F', 0, 200, 'temp'),
             ('RPM', 'Engine RPM', 'RPM', 0, 8000, 'rpm'),
@@ -276,9 +277,11 @@ class BoostGaugeTest:
                 (0.75, 1.0, self.RED),     # High boost: 15-25
             ],
             'temp': [
-                (0.0, 0.3, self.BLUE),     # Cold
-                (0.3, 0.7, self.GREEN),    # Normal
-                (0.7, 1.0, self.RED),      # Hot
+                (0.0, 0.25, self.BLUE),    # Cold: 100-140°F
+                (0.25, 0.5, self.CYAN),    # Warming: 140-180°F
+                (0.5, 0.75, self.GREEN),   # Normal: 180-220°F
+                (0.75, 0.81, self.YELLOW), # Warm: 220-230°F
+                (0.81, 1.0, self.RED),     # Hot: 230-260°F
             ],
             'load': [
                 (0.0, 0.3, self.BLUE),     # Light
@@ -299,15 +302,16 @@ class BoostGaugeTest:
 
         # Simulated values for live preview (keyed by PID id)
         # These are the RAW target values from OBD (updated at OBD poll rate)
+        # Default values at minimum (needle starts at bottom when not connected)
         self.simulated_values = {
-            'BOOST': -10.0,
-            'COOLANT_TEMP': 180.0,
-            'ENGINE_LOAD': 25.0,
-            'INTAKE_TEMP': 85.0,
-            'RPM': 2500.0,
-            'THROTTLE_POS': 15.0,
-            'OIL_TEMP': 210.0,
-            'FUEL_PRESSURE': 45.0,
+            'BOOST': -20.0,
+            'OIL_TEMP': 100.0,
+            'ENGINE_LOAD': 0.0,
+            'INTAKE_TEMP': 0.0,
+            'RPM': 0.0,
+            'THROTTLE_POS': 0.0,
+            'OIL_TEMP': 100.0,
+            'FUEL_PRESSURE': 0.0,
         }
 
         # Smoothed values for needle animation (interpolated every frame)
@@ -336,7 +340,7 @@ class BoostGaugeTest:
         # Default gauge configurations (used if settings.json is missing or incomplete)
         self.gauge_configs = [
             {"position": 0, "pid": "BOOST", "label": "BOOST", "min": -15, "max": 25, "conversion": "none", "color_preset": "boost"},
-            {"position": 1, "pid": "COOLANT_TEMP", "label": "COOLANT", "min": 100, "max": 260, "conversion": "c_to_f", "color_preset": "temp"},
+            {"position": 1, "pid": "OIL_TEMP", "label": "OIL TEMP", "min": 100, "max": 260, "conversion": "none", "color_preset": "temp"},
             {"position": 2, "pid": "ENGINE_LOAD", "label": "LOAD", "min": 0, "max": 100, "conversion": "none", "color_preset": "load"},
         ]
 
@@ -1822,14 +1826,16 @@ class BoostGaugeTest:
         self.screen.blit(title_surface, title_rect)
 
     def _draw_temp_gauge(self, temp):
-        """Draw coolant temperature gauge (100-260°F)."""
-        # Color zones: cold=blue, normal=green, hot=red
+        """Draw oil temperature gauge (100-260°F)."""
+        # Color zones: cold=blue, warming=cyan, normal=green, warm=yellow, hot=red
         color_zones = [
-            (0.0, 0.3, self.BLUE),    # Cold: 100-148°F
-            (0.3, 0.7, self.GREEN),   # Normal: 148-212°F
-            (0.7, 1.0, self.RED),     # Hot: 212-260°F
+            (0.0, 0.25, self.BLUE),    # Cold: 100-140°F
+            (0.25, 0.5, self.CYAN),    # Warming: 140-180°F
+            (0.5, 0.75, self.GREEN),   # Normal: 180-220°F
+            (0.75, 0.81, self.YELLOW), # Warm: 220-230°F
+            (0.81, 1.0, self.RED),     # Hot: 230-260°F
         ]
-        self._draw_generic_gauge(temp, 100, 260, "°F", "COOLANT TEMP", color_zones)
+        self._draw_generic_gauge(temp, 100, 260, "°F", "OIL TEMP", color_zones)
 
     def _draw_load_gauge(self, load):
         """Draw engine load gauge (0-100%)."""
@@ -2537,7 +2543,7 @@ class BoostGaugeTest:
 
         # Update gauge targets from OBD data
         self.boost_target = data.boost_psi
-        self.coolant_target = data.coolant_temp_f
+        self.oil_temp_target = data.coolant_temp_f  # Using coolant sensor as oil temp proxy
 
         # Map engine load from other PIDs if available
         if data.throttle_pos > 0:
@@ -2545,7 +2551,7 @@ class BoostGaugeTest:
 
         # Update simulated values for settings preview
         self.simulated_values['BOOST'] = data.boost_psi
-        self.simulated_values['COOLANT_TEMP'] = data.coolant_temp_f
+        self.simulated_values['OIL_TEMP'] = data.coolant_temp_f  # Using coolant sensor as oil temp proxy
         self.simulated_values['INTAKE_TEMP'] = data.intake_temp_c * 9/5 + 32  # C to F
         self.simulated_values['RPM'] = data.rpm
         self.simulated_values['THROTTLE_POS'] = data.throttle_pos
@@ -2677,7 +2683,7 @@ class BoostGaugeTest:
         pid_map = {
             "THROTTLE_POS": "0111",
             "BOOST": "010B",
-            "COOLANT_TEMP": "0105",
+            "OIL_TEMP": "0105",  # Using coolant sensor PID as oil temp proxy
             "RPM": "010C",
             "INTAKE_TEMP": "010F",
             "ENGINE_LOAD": "0104",
@@ -2734,6 +2740,67 @@ class BoostGaugeTest:
             # Coast down
             progress = (cycle - 6) / 2
             return -5 - (progress * 7)
+
+    def _simulate_oil_temp(self, t):
+        """Simulate oil temperature changes covering full range (100-260°F).
+
+        Simulates a drive: cold start -> warm up -> normal -> hot under load -> cool down
+        """
+        cycle = t % 30  # 30 second full cycle
+
+        if cycle < 8:
+            # Cold start warming up: 100 -> 180°F
+            progress = cycle / 8
+            return 100 + (progress * 80)
+        elif cycle < 14:
+            # Normal driving: 180 -> 210°F with small fluctuations
+            base = 180 + ((cycle - 8) / 6) * 30
+            return base + math.sin(t * 2) * 5
+        elif cycle < 20:
+            # Hard driving / track: 210 -> 250°F
+            progress = (cycle - 14) / 6
+            return 210 + (progress * 40) + math.sin(t * 3) * 5
+        elif cycle < 24:
+            # Peak heat: 250°F with flutter
+            return 250 + math.sin(t * 4) * 8
+        else:
+            # Cooling down: 250 -> 100°F
+            progress = (cycle - 24) / 6
+            return 250 - (progress * 150)
+
+    def _simulate_throttle(self, t):
+        """Simulate throttle position covering full range (0-100%).
+
+        Simulates driving: idle -> cruise -> acceleration -> WOT -> lift -> idle
+        """
+        cycle = t % 12  # 12 second full cycle
+
+        if cycle < 2:
+            # Idle: 0-5%
+            return 2 + math.sin(t * 2) * 2
+        elif cycle < 4:
+            # Light cruise: 5 -> 25%
+            progress = (cycle - 2) / 2
+            return 5 + (progress * 20) + math.sin(t * 3) * 3
+        elif cycle < 5.5:
+            # Acceleration: 25 -> 70%
+            progress = (cycle - 4) / 1.5
+            return 25 + (progress * 45)
+        elif cycle < 7:
+            # WOT burst: 70 -> 100%
+            progress = (cycle - 5.5) / 1.5
+            return 70 + (progress * 30)
+        elif cycle < 8:
+            # Hold WOT: 100% with slight flutter
+            return 98 + math.sin(t * 10) * 2
+        elif cycle < 9.5:
+            # Lift off: 100 -> 15%
+            progress = (cycle - 8) / 1.5
+            return 100 - (progress * 85)
+        else:
+            # Coast to idle: 15 -> 0%
+            progress = (cycle - 9.5) / 2.5
+            return 15 - (progress * 15)
 
     def run(self, target_fps=None, obd_rate=10):
         """Main loop with FPS benchmark.
@@ -2809,19 +2876,18 @@ class BoostGaugeTest:
                 t = current_time - start_time
 
                 if self.demo_mode and not self.obd_connected:
-                    # Demo mode: simulate boost/temp/load animation
+                    # Demo mode: simulate all gauges with full range coverage
                     self.boost_target = self._simulate_boost(t)
-                    self.coolant_target = 180 + math.sin(t * 0.5) * 20  # 160-200°F
+                    self.oil_temp_target = self._simulate_oil_temp(t)
                     self.engine_load_target = 30 + math.sin(t * 2) * 25 + (20 if self.boost_target > 5 else 0)
 
                     # Update all simulated values for live preview in settings
                     self.simulated_values['BOOST'] = self.boost_target
-                    self.simulated_values['COOLANT_TEMP'] = self.coolant_target
+                    self.simulated_values['OIL_TEMP'] = self.oil_temp_target
                     self.simulated_values['ENGINE_LOAD'] = self.engine_load_target
                     self.simulated_values['INTAKE_TEMP'] = 70 + math.sin(t * 0.3) * 30  # 40-100°F
                     self.simulated_values['RPM'] = 2000 + math.sin(t * 1.5) * 1500 + (2000 if self.boost_target > 5 else 0)
-                    self.simulated_values['THROTTLE_POS'] = max(5, min(100, 15 + self.boost_target * 3))
-                    self.simulated_values['OIL_TEMP'] = 200 + math.sin(t * 0.2) * 30
+                    self.simulated_values['THROTTLE_POS'] = self._simulate_throttle(t)
                     self.simulated_values['FUEL_PRESSURE'] = 40 + math.sin(t * 0.8) * 15
                 # When OBD connected, data arrives via _obd_data_callback
 
@@ -2829,7 +2895,7 @@ class BoostGaugeTest:
 
             # Smoothly tween all gauges toward target
             self._update_value('boost_psi', self.boost_target, dt)
-            self._update_value('coolant_temp', self.coolant_target, dt)
+            self._update_value('oil_temp', self.oil_temp_target, dt)
             self._update_value('engine_load', self.engine_load_target, dt)
 
             # Update transition animation if active

@@ -11,10 +11,10 @@
     },
     {
       "position": 1,
-      "pid": "COOLANT_TEMP",
-      "label": "COOLANT",
+      "pid": "OIL_TEMP",
+      "label": "OIL TEMP",
       "needle": "audi3",
-      "conversion": "c_to_f",
+      "conversion": "none",
       "offset": -10,
       "min": 100,
       "max": 260

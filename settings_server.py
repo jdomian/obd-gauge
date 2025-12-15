@@ -27,12 +27,11 @@ CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config", "settings.json")
 # Available PIDs for selection
 AVAILABLE_PIDS = [
     {"id": "BOOST", "name": "Boost Pressure", "unit": "PSI", "min": -15, "max": 25},
-    {"id": "COOLANT_TEMP", "name": "Coolant Temp", "unit": "°F", "min": 100, "max": 260},
+    {"id": "OIL_TEMP", "name": "Oil Temp", "unit": "°F", "min": 100, "max": 260},
     {"id": "ENGINE_LOAD", "name": "Engine Load", "unit": "%", "min": 0, "max": 100},
     {"id": "INTAKE_TEMP", "name": "Intake Air Temp", "unit": "°F", "min": 0, "max": 200},
     {"id": "RPM", "name": "Engine RPM", "unit": "RPM", "min": 0, "max": 8000},
     {"id": "THROTTLE_POS", "name": "Throttle Position", "unit": "%", "min": 0, "max": 100},
-    {"id": "OIL_TEMP", "name": "Oil Temperature", "unit": "°F", "min": 100, "max": 300},
     {"id": "FUEL_PRESSURE", "name": "Fuel Pressure", "unit": "PSI", "min": 0, "max": 100},
     {"id": "MAF", "name": "Mass Air Flow", "unit": "g/s", "min": 0, "max": 500},
     {"id": "TIMING_ADVANCE", "name": "Timing Advance", "unit": "°", "min": -10, "max": 50},
@@ -97,10 +96,10 @@ def get_default_config() -> dict:
             },
             {
                 "position": 1,
-                "pid": "COOLANT_TEMP",
-                "label": "COOLANT",
+                "pid": "OIL_TEMP",
+                "label": "OIL TEMP",
                 "needle": "audi3",
-                "conversion": "c_to_f",
+                "conversion": "none",
                 "min": 100,
                 "max": 260
             },
