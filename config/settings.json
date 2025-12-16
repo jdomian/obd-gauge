@@ -31,7 +31,8 @@
       "min": -20,
       "max": 20,
       "show_minor_ticks": false,
-      "show_minor_numbers": false
+      "show_minor_numbers": false,
+      "indicator_style": "arc"
     }
   ],
   "display": {

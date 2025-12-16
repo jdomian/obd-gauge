@@ -374,6 +374,7 @@ class BoostGaugeTest:
                             "show_minor_ticks": g.get("show_minor_ticks", True),
                             "show_minor_numbers": g.get("show_minor_numbers", True),
                             "center_value": g.get("center_value", None),
+                            "indicator_style": g.get("indicator_style", "needle"),  # "needle" or "arc"
                         }
                         loaded_gauges.append(gauge_config)
 
@@ -1711,7 +1712,7 @@ class BoostGaugeTest:
             gfxdraw.aacircle(self.screen, row_indicator_x, y, 4, color)
             gfxdraw.filled_circle(self.screen, row_indicator_x, y, 4, color)
 
-    def _draw_generic_gauge(self, value, min_val, max_val, unit, title, color_zones=None, center_value=None, show_minor_numbers=True, show_minor_ticks=True, radial_bars=None):
+    def _draw_generic_gauge(self, value, min_val, max_val, unit, title, color_zones=None, center_value=None, show_minor_numbers=True, show_minor_ticks=True, radial_bars=None, indicator_style="needle"):
         """Draw a generic gauge with customizable range and colors.
 
         Supports hybrid rendering: image background + procedural overlays.
@@ -1726,6 +1727,7 @@ class BoostGaugeTest:
             show_minor_ticks: If False, don't draw minor tick marks at all.
             radial_bars: List of dicts with {start, end, color} for colored arc zones.
                         e.g. [{"start": 180, "end": 220, "color": "green"}]
+            indicator_style: "needle" for traditional needle, "arc" for animated radial arc
         """
         # Default color zones if not specified
         if color_zones is None:
@@ -1885,28 +1887,45 @@ class BoostGaugeTest:
                 # Draw arc OUTSIDE the ticks (radius 225, thickness=10) - visible on top of dial image
                 self._draw_arc(self.center, 225, start_angle, end_angle, bar_color, 10)
 
-        # Draw needle - thin tapered style, appears to emerge from behind center circle
+        # Calculate normalized value and angle for indicator
         val_normalized = max(0, min(1, (value - min_val) / (max_val - min_val)))
         angle = gauge_start_angle + (val_normalized * self.sweep_angle)
 
-        # Needle geometry: thin tapered needle from center to outer ring
-        # The center circle drawn AFTER will mask the base
-        center_circle_radius = 75  # Match the Audi dial's inner circle
-        needle_tip_radius = 195    # How far the tip extends (near outer edge, inside numbers)
-        needle_base_width = 4      # Width at the base (thin like audi3 needle)
+        # Determine indicator color based on position in range (used by both styles)
+        val_pct = (value - min_val) / (max_val - min_val)
+        indicator_color = self.GREEN
+        for start_pct, end_pct, color in color_zones:
+            if start_pct <= val_pct <= end_pct:
+                indicator_color = color
+                break
 
-        # Calculate needle points - simple triangle from center outward
-        tip = self._get_point(self.center, angle, needle_tip_radius)
-        base_left = self._get_point(self.center, angle + 90, needle_base_width)
-        base_right = self._get_point(self.center, angle - 90, needle_base_width)
+        if indicator_style == "arc":
+            # ARC INDICATOR: Animated radial arc from min to current value
+            # Draw arc from start angle to current value angle
+            # Color changes based on current value's zone
+            arc_radius = 210  # Same position as major ticks
+            arc_thickness = 20  # Same height as major ticks
+            self._draw_arc(self.center, arc_radius, gauge_start_angle, angle, indicator_color, arc_thickness)
+        else:
+            # NEEDLE INDICATOR: Traditional thin tapered needle
+            # Needle geometry: thin tapered needle from center to outer ring
+            # The center circle drawn AFTER will mask the base
+            center_circle_radius = 75  # Match the Audi dial's inner circle
+            needle_tip_radius = 195    # How far the tip extends (near outer edge, inside numbers)
+            needle_base_width = 4      # Width at the base (thin like audi3 needle)
 
-        # Draw needle as triangle (tip + 2 base points at center)
-        pygame.draw.polygon(self.screen, self.RED, [tip, base_left, base_right])
-        # White edge highlight
-        pygame.draw.polygon(self.screen, self.WHITE, [tip, base_left, base_right], 1)
+            # Calculate needle points - simple triangle from center outward
+            tip = self._get_point(self.center, angle, needle_tip_radius)
+            base_left = self._get_point(self.center, angle + 90, needle_base_width)
+            base_right = self._get_point(self.center, angle - 90, needle_base_width)
+
+            # Draw needle as triangle (tip + 2 base points at center)
+            pygame.draw.polygon(self.screen, self.RED, [tip, base_left, base_right])
+            # White edge highlight
+            pygame.draw.polygon(self.screen, self.WHITE, [tip, base_left, base_right], 1)
 
         # Center hub - blit pre-rendered surface (PERF: much faster than gfxdraw per frame)
-        # Drawn AFTER needle to create masking effect (needle appears behind)
+        # Drawn AFTER indicator to create masking effect
         if self._hub_surface:
             hub_x = self.center[0] - self._hub_offset
             hub_y = self.center[1] - self._hub_offset
@@ -1916,16 +1935,9 @@ class BoostGaugeTest:
         pygame.draw.rect(self.screen, self.AUDI_CHARCOAL, (170, 300, 140, 60))
         pygame.draw.rect(self.screen, self.AUDI_DIVIDER, (170, 300, 140, 60), 2)
 
-        # Determine color based on position in range
-        val_pct = (value - min_val) / (max_val - min_val)
-        display_color = self.GREEN
-        for start_pct, end_pct, color in color_zones:
-            if start_pct <= val_pct <= end_pct:
-                display_color = color
-                break
-
+        # Use indicator_color (already computed above) for digital readout
         text = f"{value:.1f}"  # Always show 1 decimal place
-        val_surface = self._font_medium.render(text, True, display_color)
+        val_surface = self._font_medium.render(text, True, indicator_color)
         val_rect = val_surface.get_rect(center=(240, 330))
         self.screen.blit(val_surface, val_rect)
 
@@ -2055,8 +2067,11 @@ class BoostGaugeTest:
         # Get radial_bars if specified (colored arc zones)
         radial_bars = gauge_config.get("radial_bars", None)
 
+        # Get indicator_style (needle or arc)
+        indicator_style = gauge_config.get("indicator_style", "needle")
+
         # Draw the gauge with smoothed value
-        self._draw_generic_gauge(value, min_val, max_val, unit, label, color_zones, center_value, show_minor_numbers, show_minor_ticks, radial_bars)
+        self._draw_generic_gauge(value, min_val, max_val, unit, label, color_zones, center_value, show_minor_numbers, show_minor_ticks, radial_bars, indicator_style)
 
     def _get_unit_for_pid(self, pid, conversion="none"):
         """Get display unit for a PID."""
