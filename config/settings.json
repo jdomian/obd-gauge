@@ -17,7 +17,10 @@
       "conversion": "none",
       "offset": -10,
       "min": 100,
-      "max": 260
+      "max": 260,
+      "radial_bars": [
+        {"start": 180, "end": 220, "color": "green"}
+      ]
     },
     {
       "position": 2,
@@ -26,7 +29,9 @@
       "needle": "audi3",
       "conversion": "none",
       "min": -20,
-      "max": 30
+      "max": 20,
+      "show_minor_ticks": false,
+      "show_minor_numbers": false
     }
   ],
   "display": {

@@ -95,7 +95,7 @@ class BoostGaugeTest:
         gc.disable()
         print("[GC] Automatic garbage collection disabled")
 
-        self.center = (240, 240)
+        self.center = (240, 250)  # Shifted down 10px to center gauge on screen
         self._running = False
         self._clock = pygame.time.Clock()
 
@@ -215,6 +215,8 @@ class BoostGaugeTest:
         self.hotspot_stopping = False
         self.client_connected = False
         self.client_check_thread = None
+        self.hotspot_confirm_pending = False  # Requires tap confirmation before starting
+        self.hotspot_confirm_time = 0  # When confirmation was requested (expires after 3s)
 
         # Bluetooth state
         self.bt_status = None
@@ -304,13 +306,12 @@ class BoostGaugeTest:
         # These are the RAW target values from OBD (updated at OBD poll rate)
         # Default values at minimum (needle starts at bottom when not connected)
         self.simulated_values = {
-            'BOOST': -20.0,
+            'BOOST': 0.0,  # Start at 0 (12 o'clock position)
             'OIL_TEMP': 100.0,
             'ENGINE_LOAD': 0.0,
             'INTAKE_TEMP': 0.0,
             'RPM': 0.0,
             'THROTTLE_POS': 0.0,
-            'OIL_TEMP': 100.0,
             'FUEL_PRESSURE': 0.0,
         }
 
@@ -368,6 +369,11 @@ class BoostGaugeTest:
                             "conversion": g.get("conversion", "none"),
                             "color_preset": g.get("color_preset", self._get_color_preset_for_pid(g.get("pid", ""))),
                             "needle": g.get("needle", "default"),
+                            # Visual customization options
+                            "radial_bars": g.get("radial_bars", None),
+                            "show_minor_ticks": g.get("show_minor_ticks", True),
+                            "show_minor_numbers": g.get("show_minor_numbers", True),
+                            "center_value": g.get("center_value", None),
                         }
                         loaded_gauges.append(gauge_config)
 
@@ -1178,8 +1184,17 @@ class BoostGaugeTest:
             if 150 < y < 350:
                 # Tap on center area toggles hotspot
                 if not self.hotspot_active and not self.hotspot_starting:
-                    print("Tap -> Starting hotspot...")
-                    self._start_hotspot_async()
+                    # Require confirmation to start hotspot (prevents accidental activation)
+                    if self.hotspot_confirm_pending and time.time() - self.hotspot_confirm_time < 3:
+                        # Second tap within 3 seconds - actually start
+                        print("Tap -> Confirmed! Starting hotspot...")
+                        self.hotspot_confirm_pending = False
+                        self._start_hotspot_async()
+                    else:
+                        # First tap - ask for confirmation
+                        print("Tap -> Tap again to confirm starting hotspot...")
+                        self.hotspot_confirm_pending = True
+                        self.hotspot_confirm_time = time.time()
                 elif self.hotspot_active and not self.hotspot_stopping:
                     print("Tap -> Stopping hotspot...")
                     self._stop_hotspot_async()
@@ -1408,6 +1423,7 @@ class BoostGaugeTest:
         self._cached_screen = None
         self._incoming_screen = None
         self._touch_history = []
+        self.hotspot_confirm_pending = False  # Clear hotspot confirmation on navigation
 
         # Set cooldown to prevent accidental taps
         self._nav_cooldown = time.time() + 0.3
@@ -1579,7 +1595,7 @@ class BoostGaugeTest:
 
         # Needle geometry: thin tapered needle from center to outer ring
         center_circle_radius = 75  # Match the Audi dial's inner circle
-        needle_tip_radius = 160    # How far the tip extends
+        needle_tip_radius = 195    # How far the tip extends (near outer edge, inside numbers)
         needle_base_width = 4      # Width at the base (thin like audi3 needle)
 
         # Calculate needle points - simple triangle from center outward
@@ -1593,8 +1609,8 @@ class BoostGaugeTest:
 
         # Center hub - blit pre-rendered surface (PERF: much faster than gfxdraw per frame)
         if self._hub_surface:
-            hub_x = 240 - self._hub_offset
-            hub_y = 240 - self._hub_offset
+            hub_x = self.center[0] - self._hub_offset
+            hub_y = self.center[1] - self._hub_offset
             self.screen.blit(self._hub_surface, (hub_x, hub_y))
 
     def _draw_gauge_face(self):
@@ -1695,13 +1711,21 @@ class BoostGaugeTest:
             gfxdraw.aacircle(self.screen, row_indicator_x, y, 4, color)
             gfxdraw.filled_circle(self.screen, row_indicator_x, y, 4, color)
 
-    def _draw_generic_gauge(self, value, min_val, max_val, unit, title, color_zones=None):
+    def _draw_generic_gauge(self, value, min_val, max_val, unit, title, color_zones=None, center_value=None, show_minor_numbers=True, show_minor_ticks=True, radial_bars=None):
         """Draw a generic gauge with customizable range and colors.
 
         Supports hybrid rendering: image background + procedural overlays.
         When dial_background is set to a valid image (e.g., "audi"), the image
         provides the face (chrome bezel, carbon fiber, graduations) while the
         needle, readout, and labels are drawn procedurally for smooth animation.
+
+        Args:
+            center_value: If specified, this value will be positioned at 12 o'clock (top).
+                         For boost gauges, set center_value=0 to put 0 PSI at top.
+            show_minor_numbers: If False, don't draw numbers at minor tick positions.
+            show_minor_ticks: If False, don't draw minor tick marks at all.
+            radial_bars: List of dicts with {start, end, color} for colored arc zones.
+                        e.g. [{"start": 180, "end": 220, "color": "green"}]
         """
         # Default color zones if not specified
         if color_zones is None:
@@ -1712,23 +1736,84 @@ class BoostGaugeTest:
                 (0.66, 1.0, self.RED),
             ]
 
+        # Calculate start angle - adjust if center_value is specified
+        if center_value is not None:
+            # Position center_value at 270° (12 o'clock / top)
+            # center_normalized = where center_value falls in 0-1 range
+            center_normalized = (center_value - min_val) / (max_val - min_val)
+            # start_angle + (center_normalized * sweep_angle) = 270
+            # start_angle = 270 - (center_normalized * sweep_angle)
+            gauge_start_angle = 270 - (center_normalized * self.sweep_angle)
+        else:
+            gauge_start_angle = self.start_angle
+
         # Check if we're using an image background (hybrid mode)
         use_image_bg = self._current_dial_bg is not None and self.dial_background != "default"
 
         if use_image_bg:
             # HYBRID MODE: Blit dial background image first
             # Image provides: chrome bezel, carbon fiber texture
-            self.screen.blit(self._current_dial_bg, (0, 0))
+            # Shift down 10px to center on screen (matches self.center offset)
+            self.screen.blit(self._current_dial_bg, (0, 10))
 
-            # Draw perimeter numbers using cached surfaces (PERF: no font.render per frame)
-            cached_labels = self._get_cached_labels(min_val, max_val)
-            num_labels = len(cached_labels)
-            for i, label_surface in enumerate(cached_labels):
-                val_normalized = i / (num_labels - 1)
-                angle = self.start_angle + (val_normalized * self.sweep_angle)
+            # Calculate tick interval based on range
+            val_range = max_val - min_val
+            # Special case: symmetric range spanning 0 (like -20 to +20) - use step=10 for cleaner look
+            if min_val < 0 and max_val > 0 and abs(min_val) == abs(max_val):
+                major_step = 10
+                minor_step = 5
+            # Asymmetric range spanning 0 (like -15 to +25) - use step=5 to include 0
+            elif min_val < 0 and max_val > 0:
+                major_step = 5
+                minor_step = 1
+            elif val_range <= 50:
+                major_step = 10
+                minor_step = 2
+            elif val_range <= 100:
+                major_step = 20
+                minor_step = 5
+            elif val_range <= 200:
+                major_step = 40
+                minor_step = 10
+            elif val_range <= 1000:
+                major_step = 100
+                minor_step = 20
+            else:
+                major_step = 1000
+                minor_step = 200
 
-                # Position numbers at 155px from center (inside gauge ring)
-                label_pos = self._get_point(self.center, angle, 155)
+            # Draw major tick marks
+            for val in range(int(min_val), int(max_val) + 1, major_step):
+                val_normalized = (val - min_val) / (max_val - min_val)
+                angle = gauge_start_angle + (val_normalized * self.sweep_angle)
+                inner = self._get_point(self.center, angle, 200)
+                outer = self._get_point(self.center, angle, 220)
+                pygame.draw.line(self.screen, self.WHITE, inner, outer, 3)
+
+            # Draw minor tick marks (and optionally minor numbers) - only if enabled
+            if show_minor_ticks:
+                for val in range(int(min_val), int(max_val) + 1, minor_step):
+                    if val % major_step != 0:  # Skip major tick positions
+                        val_normalized = (val - min_val) / (max_val - min_val)
+                        angle = gauge_start_angle + (val_normalized * self.sweep_angle)
+                        # Minor tick
+                        inner = self._get_point(self.center, angle, 200)
+                        outer = self._get_point(self.center, angle, 210)
+                        pygame.draw.line(self.screen, self.AUDI_GRAY_MUTED, inner, outer, 1)
+                        # Minor number (smaller, muted color) - only if enabled
+                        if show_minor_numbers:
+                            label_surface = self._font_tiny.render(f"{int(val)}", True, self.AUDI_GRAY_MUTED)
+                            label_pos = self._get_point(self.center, angle, 185)
+                            label_rect = label_surface.get_rect(center=label_pos)
+                            self.screen.blit(label_surface, label_rect)
+
+            # Draw major numbers at major tick positions
+            for val in range(int(min_val), int(max_val) + 1, major_step):
+                val_normalized = (val - min_val) / (max_val - min_val)
+                angle = gauge_start_angle + (val_normalized * self.sweep_angle)
+                # Major number (larger, white) - positioned inward from ticks
+                label_surface = self._font_small.render(f"{int(val)}", True, self.WHITE)
+                label_pos = self._get_point(self.center, angle, 175)
                 label_rect = label_surface.get_rect(center=label_pos)
                 self.screen.blit(label_surface, label_rect)
         else:
@@ -1739,8 +1824,8 @@ class BoostGaugeTest:
 
             # Draw colored arc zones
             for start_pct, end_pct, color in color_zones:
-                start_a = self.start_angle + (start_pct * self.sweep_angle)
-                end_a = self.start_angle + (end_pct * self.sweep_angle)
+                start_a = gauge_start_angle + (start_pct * self.sweep_angle)
+                end_a = gauge_start_angle + (end_pct * self.sweep_angle)
                 self._draw_arc(self.center, 190, start_a, end_a, color, 8)
 
             # Calculate tick interval based on range
@@ -1757,7 +1842,7 @@ class BoostGaugeTest:
             # Tick marks and labels
             for val in range(int(min_val), int(max_val) + 1, major_step):
                 val_normalized = (val - min_val) / (max_val - min_val)
-                angle = self.start_angle + (val_normalized * self.sweep_angle)
+                angle = gauge_start_angle + (val_normalized * self.sweep_angle)
 
                 # Major tick
                 inner = self._get_point(self.center, angle, 165)
@@ -1772,14 +1857,42 @@ class BoostGaugeTest:
 
         # === PROCEDURAL OVERLAYS (drawn on both modes) ===
 
+        # Draw radial bars (colored arc zones) if specified
+        if radial_bars:
+            # Map color names to RGB
+            color_map = {
+                "green": self.GREEN,
+                "red": self.RED,
+                "blue": self.BLUE,
+                "yellow": self.YELLOW,
+                "orange": (255, 165, 0),
+                "cyan": self.CYAN,
+                "white": self.WHITE,
+                "gray": self.GRAY,
+            }
+            for bar in radial_bars:
+                bar_start = bar.get("start", min_val)
+                bar_end = bar.get("end", max_val)
+                bar_color_name = bar.get("color", "green")
+                bar_color = color_map.get(bar_color_name.lower(), self.GREEN)
+
+                # Convert values to angles
+                start_normalized = (bar_start - min_val) / (max_val - min_val)
+                end_normalized = (bar_end - min_val) / (max_val - min_val)
+                start_angle = gauge_start_angle + (start_normalized * self.sweep_angle)
+                end_angle = gauge_start_angle + (end_normalized * self.sweep_angle)
+
+                # Draw arc OUTSIDE the ticks (radius 225, thickness=10) - visible on top of dial image
+                self._draw_arc(self.center, 225, start_angle, end_angle, bar_color, 10)
+
         # Draw needle - thin tapered style, appears to emerge from behind center circle
         val_normalized = max(0, min(1, (value - min_val) / (max_val - min_val)))
-        angle = self.start_angle + (val_normalized * self.sweep_angle)
+        angle = gauge_start_angle + (val_normalized * self.sweep_angle)
 
         # Needle geometry: thin tapered needle from center to outer ring
         # The center circle drawn AFTER will mask the base
         center_circle_radius = 75  # Match the Audi dial's inner circle
-        needle_tip_radius = 160    # How far the tip extends
+        needle_tip_radius = 195    # How far the tip extends (near outer edge, inside numbers)
         needle_base_width = 4      # Width at the base (thin like audi3 needle)
 
         # Calculate needle points - simple triangle from center outward
@@ -1795,8 +1908,8 @@ class BoostGaugeTest:
         # Center hub - blit pre-rendered surface (PERF: much faster than gfxdraw per frame)
         # Drawn AFTER needle to create masking effect (needle appears behind)
         if self._hub_surface:
-            hub_x = 240 - self._hub_offset
-            hub_y = 240 - self._hub_offset
+            hub_x = self.center[0] - self._hub_offset
+            hub_y = self.center[1] - self._hub_offset
             self.screen.blit(self._hub_surface, (hub_x, hub_y))
 
         # Digital readout - Audi MMI style
@@ -1822,7 +1935,7 @@ class BoostGaugeTest:
         self.screen.blit(unit_surface, unit_rect)
 
         title_surface = self._font_small.render(title, True, self.AUDI_WHITE)
-        title_rect = title_surface.get_rect(center=(240, 60))
+        title_rect = title_surface.get_rect(center=(240, 105))
         self.screen.blit(title_surface, title_rect)
 
     def _draw_temp_gauge(self, temp):
@@ -1932,8 +2045,18 @@ class BoostGaugeTest:
         # Determine unit based on PID or config
         unit = self._get_unit_for_pid(pid, conversion)
 
+        # Get center_value if specified (positions that value at 12 o'clock)
+        center_value = gauge_config.get("center_value", None)
+
+        # Get show_minor_numbers and show_minor_ticks (default True for backwards compatibility)
+        show_minor_numbers = gauge_config.get("show_minor_numbers", True)
+        show_minor_ticks = gauge_config.get("show_minor_ticks", True)
+
+        # Get radial_bars if specified (colored arc zones)
+        radial_bars = gauge_config.get("radial_bars", None)
+
         # Draw the gauge with smoothed value
-        self._draw_generic_gauge(value, min_val, max_val, unit, label, color_zones)
+        self._draw_generic_gauge(value, min_val, max_val, unit, label, color_zones, center_value, show_minor_numbers, show_minor_ticks, radial_bars)
 
     def _get_unit_for_pid(self, pid, conversion="none"):
         """Get display unit for a PID."""
@@ -2168,24 +2291,54 @@ class BoostGaugeTest:
 
         else:
             # Hotspot is OFF - show compact start button
-            # Draw tap target with Audi red
             btn_y = hotspot_y_base + 75
-            pygame.draw.circle(self.screen, self.AUDI_RED_DIM, (240, btn_y), 55)
-            pygame.draw.circle(self.screen, self.AUDI_RED, (240, btn_y), 55, 2)
 
-            # WiFi icon in Audi red (smaller)
-            for i, r in enumerate([18, 32, 46]):
-                arc_color = self.AUDI_RED if i < 2 else self.AUDI_RED_DIM
-                pygame.draw.arc(self.screen, arc_color, (240-r, btn_y-r, r*2, r*2), 0.5, 2.6, 2)
+            # Check if confirmation is pending (and not expired)
+            confirm_pending = self.hotspot_confirm_pending and time.time() - self.hotspot_confirm_time < 3
 
-            # Dot at bottom of wifi icon
-            gfxdraw.aacircle(self.screen, 240, btn_y + 14, 4, self.AUDI_RED)
-            gfxdraw.filled_circle(self.screen, 240, btn_y + 14, 4, self.AUDI_RED)
+            if confirm_pending:
+                # CONFIRMATION REQUIRED - show pulsing amber state
+                # Pulse effect for urgency
+                pulse = 0.7 + 0.3 * math.sin(time.time() * 6)
+                amber_pulse = tuple(int(c * pulse) for c in self.AUDI_AMBER)
 
-            # Text below button
-            start_text = self._font_tiny.render("TAP TO START HOTSPOT", True, self.AUDI_GRAY)
-            start_rect = start_text.get_rect(center=(240, btn_y + 75))
-            self.screen.blit(start_text, start_rect)
+                # Draw tap target with amber (confirmation color)
+                pygame.draw.circle(self.screen, self.AUDI_CHARCOAL, (240, btn_y), 55)
+                pygame.draw.circle(self.screen, amber_pulse, (240, btn_y), 55, 3)
+
+                # Checkmark icon in amber
+                # Draw a simple checkmark
+                check_points = [(215, btn_y), (232, btn_y + 18), (265, btn_y - 15)]
+                pygame.draw.lines(self.screen, amber_pulse, False, check_points, 4)
+
+                # Confirmation text below button - pulsing
+                confirm_text = self._font_tiny.render("TAP AGAIN TO CONFIRM", True, amber_pulse)
+                confirm_rect = confirm_text.get_rect(center=(240, btn_y + 75))
+                self.screen.blit(confirm_text, confirm_rect)
+
+                # Countdown hint
+                remaining = max(0, 3 - (time.time() - self.hotspot_confirm_time))
+                countdown_text = self._font_tiny.render(f"expires in {remaining:.0f}s", True, self.AUDI_GRAY_MUTED)
+                countdown_rect = countdown_text.get_rect(center=(240, btn_y + 95))
+                self.screen.blit(countdown_text, countdown_rect)
+            else:
+                # Normal state - Draw tap target with Audi red
+                pygame.draw.circle(self.screen, self.AUDI_RED_DIM, (240, btn_y), 55)
+                pygame.draw.circle(self.screen, self.AUDI_RED, (240, btn_y), 55, 2)
+
+                # WiFi icon in Audi red (smaller)
+                for i, r in enumerate([18, 32, 46]):
+                    arc_color = self.AUDI_RED if i < 2 else self.AUDI_RED_DIM
+                    pygame.draw.arc(self.screen, arc_color, (240-r, btn_y-r, r*2, r*2), 0.5, 2.6, 2)
+
+                # Dot at bottom of wifi icon
+                gfxdraw.aacircle(self.screen, 240, btn_y + 14, 4, self.AUDI_RED)
+                gfxdraw.filled_circle(self.screen, 240, btn_y + 14, 4, self.AUDI_RED)
+
+                # Text below button
+                start_text = self._font_tiny.render("TAP TO START HOTSPOT", True, self.AUDI_GRAY)
+                start_rect = start_text.get_rect(center=(240, btn_y + 75))
+                self.screen.blit(start_text, start_rect)
 
         # Audi MMI navigation hints (Row 2: WiFi/Settings)
         self._draw_audi_nav_hints(["↑ bluetooth", "↓ system"])
