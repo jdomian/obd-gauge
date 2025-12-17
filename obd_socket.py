@@ -467,7 +467,8 @@ class OBDSocket:
         coolant_c = self.query_pid("0105")
         if coolant_c is not None:
             self.data.coolant_temp_c = coolant_c
-            self.data.coolant_temp_f = coolant_c * 9/5 + 32
+            # Calibrated to match RS7 HUD (linear regression from real data)
+            self.data.coolant_temp_f = 1.279 * (coolant_c * 9/5 + 32) - 60.96
 
         # Query RPM
         rpm = self.query_pid("010C")
@@ -485,10 +486,11 @@ class OBDSocket:
         if iat_c is not None:
             self.data.intake_temp_c = iat_c
 
-        # Query throttle position
-        throttle = self.query_pid("0111")
+        # Query accelerator pedal position (APP_D) - better than throttle plate position
+        throttle = self.query_pid("0149")
         if throttle is not None:
-            self.data.throttle_pos = throttle
+            # Calibrated: 12% at rest -> 0%, 88% at full -> 100%
+            self.data.throttle_pos = max(0, min(100, (throttle - 12) * 1.316))
 
         self.data.timestamp = time.time()
         return self.data
@@ -505,19 +507,21 @@ class OBDSocket:
         Only polls whichever gauge is currently visible on screen.
         Call set_active_pid() when user swipes to different gauge.
         """
-        # Get active PID (default to throttle)
-        pid = getattr(self, '_active_pid', '0111')
+        # Get active PID (default to accelerator pedal position)
+        pid = getattr(self, '_active_pid', '0149')
 
         result = self.query_pid(pid, fast=True)
         if result is not None:
-            if pid == '0111':  # Throttle
-                self.data.throttle_pos = result
+            if pid == '0149' or pid == '0111':  # Accelerator pedal or throttle
+                # Calibrated: 12% at rest -> 0%, 88% at full -> 100%
+                self.data.throttle_pos = max(0, min(100, (result - 12) * 1.316))
             elif pid == '010B':  # MAP/Boost
                 self.data.map_kpa = result
                 self.data.boost_psi = (result - 101.325) * 0.145038
             elif pid == '0105':  # Coolant temp
                 self.data.coolant_temp_c = result
-                self.data.coolant_temp_f = result * 9/5 + 32
+                # Calibrated to match RS7 HUD (linear regression from real data)
+                self.data.coolant_temp_f = 1.279 * (result * 9/5 + 32) - 60.96
             elif pid == '010C':  # RPM
                 self.data.rpm = result
             elif pid == '010F':  # Intake air temp
