@@ -51,6 +51,15 @@ except ImportError as e:
     ConnectionState = None
     OBDData = None
 
+# Import PiSugar battery module
+try:
+    from pisugar import PiSugarClient
+    PISUGAR_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: PiSugar module not available: {e}")
+    PISUGAR_AVAILABLE = False
+    PiSugarClient = None
+
 # Try to import QR code library
 try:
     import qrcode
@@ -228,6 +237,16 @@ class BoostGaugeTest:
         self.demo_mode = True  # Start with demo mode ON
         self.demo_time = 0.0   # For animation timing
 
+        # FPS display toggle (off by default - enable in settings)
+        self.show_fps = False
+
+        # PiSugar battery monitor
+        if PISUGAR_AVAILABLE:
+            self.pisugar = PiSugarClient()
+            print("[PiSugar] Battery client initialized")
+        else:
+            self.pisugar = None
+
         # OBD Socket Connection (new socket-based approach)
         self.obd_connection = None  # OBDSocket instance
         self.obd_state = "disconnected"  # disconnected, connecting, connected, error
@@ -274,9 +293,11 @@ class BoostGaugeTest:
         # Color zone presets for different PID types
         self.color_zone_presets = {
             'boost': [
-                (0.0, 0.375, self.BLUE),   # Vacuum: -15 to 0
-                (0.375, 0.75, self.GREEN), # Low boost: 0-15
-                (0.75, 1.0, self.RED),     # High boost: 15-25
+                # Calibrated for -20 to +20 PSI range (RS7 Stage 1)
+                (0.0, 0.50, self.BLUE),    # Vacuum: -20 to 0 PSI (decel, cruise, idle)
+                (0.50, 0.70, self.GREEN),  # Low boost: 0 to +8 PSI (daily driving)
+                (0.70, 0.85, self.YELLOW), # Medium boost: +8 to +14 PSI (spirited)
+                (0.85, 1.0, self.RED),     # High boost: +14 to +20 PSI (full send)
             ],
             'temp': [
                 (0.0, 0.25, self.BLUE),    # Cold: 100-140°F
@@ -388,10 +409,11 @@ class BoostGaugeTest:
                 self.target_fps = display.get("fps", 30)
                 self.smoothing = display.get("smoothing", 0.25)
                 self.demo_mode = display.get("demo_mode", True)
+                self.show_fps = display.get("show_fps", False)
                 self.dial_background = display.get("dial_background", "default")
                 self.animated_transitions = display.get("animated_transitions", True)
 
-                print(f"[Settings] Display: fps={self.target_fps}, demo={self.demo_mode}, dial={self.dial_background}, animated={self.animated_transitions}")
+                print(f"[Settings] Display: fps={self.target_fps}, demo={self.demo_mode}, show_fps={self.show_fps}, dial={self.dial_background}")
 
                 # Load OBD settings
                 obd = settings.get("obd", {})
@@ -1122,11 +1144,11 @@ class BoostGaugeTest:
 
     def _handle_brightness_drag(self, x, y):
         """Handle drag on brightness slider."""
-        # Slider is centered, 300px wide, y=215 on system screen
+        # Slider is centered, 300px wide, y=255 on system screen (shifted for FPS toggle)
         slider_left = 90
         slider_right = 390
         slider_width = slider_right - slider_left
-        slider_y = 215  # Center of slider
+        slider_y = 255  # Center of slider
 
         # Only respond if touch is near the slider vertically
         if slider_left <= x <= slider_right and abs(y - slider_y) < 30:
@@ -1200,18 +1222,22 @@ class BoostGaugeTest:
                     print("Tap -> Stopping hotspot...")
                     self._stop_hotspot_async()
         elif self.screen_row == 3:
-            # System screen - demo toggle, brightness slider, or power buttons
-            if y >= 80 and y <= 140:
-                # Demo mode toggle area (top)
+            # System screen - demo toggle, FPS toggle, brightness slider, power buttons
+            if y >= 80 and y <= 130:
+                # Demo mode toggle area
                 if x >= 280 and x <= 400:
-                    # Toggle demo mode
                     self.demo_mode = not self.demo_mode
                     print(f"Demo mode: {'ON' if self.demo_mode else 'OFF'}")
-            elif y >= 195 and y <= 235:
-                # Brightness slider area
+            elif y >= 135 and y <= 180:
+                # FPS toggle area (new)
+                if x >= 280 and x <= 400:
+                    self.show_fps = not self.show_fps
+                    print(f"FPS display: {'ON' if self.show_fps else 'OFF'}")
+            elif y >= 240 and y <= 275:
+                # Brightness slider area (shifted down)
                 self._handle_brightness_drag(x, y)
-            elif y >= 335 and y <= 390:
-                # Power button area - check cooldown to prevent accidental taps after swipe
+            elif y >= 355 and y <= 410:
+                # Power button area (shifted down)
                 if time.time() < self._nav_cooldown:
                     print(f"Tap ignored (cooldown active)")
                     return
@@ -1225,7 +1251,7 @@ class BoostGaugeTest:
                     self._graceful_reboot()
 
     def _graceful_shutdown(self):
-        """Gracefully shutdown the Pi."""
+        """Gracefully shutdown the Pi and power off PiSugar."""
         # Show shutdown message
         self.screen.fill(self.BLACK)
         gfxdraw.filled_circle(self.screen, 240, 240, 200, self.DARK_GRAY)
@@ -1233,6 +1259,11 @@ class BoostGaugeTest:
         msg_rect = msg.get_rect(center=(240, 240))
         self.screen.blit(msg, msg_rect)
         self._flip()
+
+        # Tell PiSugar to cut power after Pi halts (3 second delay)
+        if self.pisugar:
+            print("[PiSugar] Scheduling power-off after shutdown...")
+            self.pisugar.power_off(delay_seconds=5)
 
         # Set pending action and stop main loop - action executed after clean exit
         self._pending_action = 'shutdown'
@@ -1681,10 +1712,50 @@ class BoostGaugeTest:
         self.screen.blit(unit_surface, unit_rect)
 
     def _draw_fps(self):
-        """Draw FPS counter."""
-        fps_text = f"FPS: {self.fps:.1f}"
-        fps_surface = self._font_small.render(fps_text, True, self.YELLOW)
-        self.screen.blit(fps_surface, (10, 10))
+        """Draw FPS counter - bright green, positioned based on battery display."""
+        fps_text = f"{self.fps:.0f} FPS"
+        fps_surface = self._font_medium.render(fps_text, True, (0, 255, 0))
+        # Position: right of center if battery shown, centered if not
+        if self.pisugar and self.pisugar.get_battery() is not None:
+            x = 280  # Right side when battery is shown
+        else:
+            x = 240 - fps_surface.get_width() // 2  # Centered
+        self.screen.blit(fps_surface, (x, 8))
+
+    def _draw_battery_indicator(self):
+        """Draw tiny battery percentage at top center."""
+        if not self.pisugar:
+            return
+
+        battery = self.pisugar.get_battery()
+        if battery is None:
+            return  # PiSugar not responding
+
+        charging = self.pisugar.is_charging()
+
+        # Color based on level and charging state
+        if charging:
+            color = (100, 255, 100)  # Green when charging
+        elif battery > 50:
+            color = (200, 200, 200)  # Light gray - normal
+        elif battery > 20:
+            color = (255, 200, 100)  # Yellow/orange - low
+        else:
+            color = (255, 100, 100)  # Red - critical
+
+        # Tiny text with lightning bolt if charging
+        text = f"⚡{int(battery)}%" if charging else f"{int(battery)}%"
+
+        # Use tiny font
+        surface = self._font_tiny.render(text, True, color)
+
+        # Position: left of center if FPS shown, centered if not
+        if self.show_fps:
+            x = 200 - surface.get_width()  # Left side
+        else:
+            x = 240 - surface.get_width() // 2  # Centered
+
+        self.screen.blit(surface, (x, 5))
 
     def _draw_screen_indicator(self):
         """Draw dots at bottom showing current screen position in grid."""
@@ -2549,24 +2620,50 @@ class BoostGaugeTest:
 
         # Demo mode description
         demo_desc = self._font_tiny.render("Needle sweep test animation", True, self.AUDI_GRAY)
-        demo_desc_rect = demo_desc.get_rect(midleft=(90, 125))
+        demo_desc_rect = demo_desc.get_rect(midleft=(90, 120))
         self.screen.blit(demo_desc, demo_desc_rect)
 
-        # Divider after demo mode - Audi subtle gray
-        pygame.draw.line(self.screen, self.AUDI_DIVIDER, (100, 150), (380, 150), 1)
+        # FPS Counter toggle (below demo mode)
+        fps_label = self._font_small.render("FPS Counter", True, self.AUDI_WHITE)
+        fps_label_rect = fps_label.get_rect(midleft=(90, 150))
+        self.screen.blit(fps_label, fps_label_rect)
 
-        # Brightness section (moved down)
+        # FPS toggle button - same style as demo mode
+        fps_toggle_x = 340
+        fps_toggle_y = 150
+        fps_toggle_rect = pygame.Rect(fps_toggle_x - toggle_width//2, fps_toggle_y - toggle_height//2, toggle_width, toggle_height)
+
+        if self.show_fps:
+            self._draw_capsule(self.AUDI_RED_DIM, fps_toggle_rect)
+            self._draw_capsule(self.AUDI_RED, fps_toggle_rect, 2)
+            fps_knob_pos = fps_toggle_x + toggle_width//2 - 14
+        else:
+            self._draw_capsule(self.AUDI_CHARCOAL, fps_toggle_rect)
+            self._draw_capsule(self.AUDI_GRAY_MUTED, fps_toggle_rect, 2)
+            fps_knob_pos = fps_toggle_x - toggle_width//2 + 14
+
+        gfxdraw.aacircle(self.screen, fps_knob_pos, fps_toggle_y, 10, self.AUDI_WHITE)
+        gfxdraw.filled_circle(self.screen, fps_knob_pos, fps_toggle_y, 10, self.AUDI_WHITE)
+
+        fps_desc = self._font_tiny.render("Show frame rate on screen", True, self.AUDI_GRAY)
+        fps_desc_rect = fps_desc.get_rect(midleft=(90, 170))
+        self.screen.blit(fps_desc, fps_desc_rect)
+
+        # Divider after toggles - Audi subtle gray
+        pygame.draw.line(self.screen, self.AUDI_DIVIDER, (100, 195), (380, 195), 1)
+
+        # Brightness section (shifted down)
         bright_label = self._font_small.render("Brightness", True, self.AUDI_WHITE)
-        bright_rect = bright_label.get_rect(midleft=(90, 180))
+        bright_rect = bright_label.get_rect(midleft=(90, 220))
         self.screen.blit(bright_label, bright_rect)
 
         # Current percentage - Audi red accent
         pct_text = self._font_small.render(f"{self.brightness}%", True, self.AUDI_RED)
-        pct_rect = pct_text.get_rect(midright=(390, 180))
+        pct_rect = pct_text.get_rect(midright=(390, 220))
         self.screen.blit(pct_text, pct_rect)
 
-        # Slider track
-        slider_y = 215
+        # Slider track (shifted down for FPS toggle)
+        slider_y = 255
         slider_left = 90
         slider_right = 390
         slider_width = slider_right - slider_left
@@ -2595,25 +2692,22 @@ class BoostGaugeTest:
         max_rect = max_label.get_rect(topright=(slider_right, slider_y + 15))
         self.screen.blit(max_label, max_rect)
 
-        # Note about brightness
-        bright_note = self._font_tiny.render("(Software dimming for night driving)", True, self.AUDI_GRAY_MUTED)
-        bright_note_rect = bright_note.get_rect(center=(240, 255))
-        self.screen.blit(bright_note, bright_note_rect)
+        # Note about brightness (removed - tight on space)
 
         # Divider before power
-        pygame.draw.line(self.screen, self.AUDI_DIVIDER, (100, 280), (380, 280), 1)
+        pygame.draw.line(self.screen, self.AUDI_DIVIDER, (100, 300), (380, 300), 1)
 
         # Power section label
         power_label = self._font_small.render("Power", True, self.AUDI_WHITE)
-        power_rect = power_label.get_rect(center=(240, 305))
+        power_rect = power_label.get_rect(center=(240, 325))
         self.screen.blit(power_label, power_rect)
 
         # Shutdown button (left) - Audi red style
-        shutdown_btn_rect = pygame.Rect(70, 335, 150, 55)
+        shutdown_btn_rect = pygame.Rect(70, 355, 150, 50)
         self._draw_audi_button("SHUTDOWN", shutdown_btn_rect, active=True, color_scheme="red")
 
         # Reboot button (right) - Audi default style
-        reboot_btn_rect = pygame.Rect(260, 335, 150, 55)
+        reboot_btn_rect = pygame.Rect(260, 355, 150, 50)
         self._draw_audi_button("REBOOT", reboot_btn_rect, active=True, color_scheme="default")
 
         # Audi MMI navigation hints
@@ -3098,7 +3192,13 @@ class BoostGaugeTest:
                     # Row 3: System screen (Brightness/Reboot/Restart)
                     self._draw_brightness_screen()
 
-            self._draw_fps()
+            # Draw battery indicator (always, if PiSugar available)
+            self._draw_battery_indicator()
+
+            # Draw FPS counter only if enabled in settings
+            if self.show_fps:
+                self._draw_fps()
+
             self._draw_screen_indicator()
 
             # Update display

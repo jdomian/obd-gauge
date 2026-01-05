@@ -327,13 +327,13 @@ SETTINGS_HTML = """<!DOCTYPE html>
                         <div>
                             <label>OBD Rate</label>
                             <select id="obd_rate" onchange="updateConfig()">
-                                ${[10, 15, 20, 25, 30].map(r => `<option value="${r}" ${config.obd.rate_hz === r ? 'selected' : ''}>${r} Hz</option>`).join('')}
+                                ${[10, 15, 20, 25, 30, 40, 50, 60].map(r => `<option value="${r}" ${config.obd.rate_hz === r ? 'selected' : ''}>${r} Hz</option>`).join('')}
                             </select>
                         </div>
                     </div>
                     <div class="slider-container">
                         <label>Needle Smoothing</label>
-                        <input type="range" id="smoothing" min="0.1" max="0.5" step="0.05" value="${config.display.smoothing}" onchange="updateConfig()">
+                        <input type="range" id="smoothing" min="0" max="0.5" step="0.05" value="${config.display.smoothing}" onchange="updateConfig()">
                         <div class="slider-value" id="smoothing_val">${config.display.smoothing}</div>
                     </div>
                 </div>

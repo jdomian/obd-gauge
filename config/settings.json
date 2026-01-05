@@ -19,7 +19,11 @@
       "min": 100,
       "max": 260,
       "radial_bars": [
-        {"start": 180, "end": 220, "color": "green"}
+        {
+          "start": 180,
+          "end": 220,
+          "color": "green"
+        }
       ]
     },
     {
@@ -40,6 +44,7 @@
     "smoothing": 0,
     "dial_background": "audi",
     "demo_mode": false,
+    "show_fps": false,
     "animated_transitions": true
   },
   "obd": {

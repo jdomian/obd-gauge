@@ -126,6 +126,45 @@ The UI uses a 2D grid navigation system:
 }
 ```
 
+## Settings Web Server
+
+The gauge can be configured via a web interface. Two access methods:
+
+### Method 1: On-Device Hotspot (In Car)
+
+1. Swipe DOWN to Row 1 (Settings screen)
+2. Tap to enable WiFi hotspot
+3. Connect phone to `OBD-Gauge` WiFi network
+4. Scan QR code or browse to `http://192.168.4.1:8080`
+
+### Method 2: Local Network (Development)
+
+Run the settings server on any machine with the repo:
+
+```bash
+# Start server (binds to 0.0.0.0:8080)
+python3 settings_server.py test
+
+# Access from any device on the network
+# http://<server-ip>:8080
+```
+
+**Development workflow (claude-server):**
+```bash
+# 1. Start settings server locally
+python3 settings_server.py test
+
+# 2. Edit settings at http://10.0.0.99:8080
+
+# 3. Push changes to gauge
+rsync -avz config/settings.json claude@10.0.0.219:~/obd-gauge/config/
+
+# 4. Restart gauge to apply
+ssh claude@10.0.0.219 "sudo reboot"
+```
+
+**Note**: Firewall must allow port 8080 (`sudo ufw allow 8080/tcp`)
+
 ## Command Line Options
 
 | Option | Default | Description |

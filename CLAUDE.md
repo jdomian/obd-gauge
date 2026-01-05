@@ -120,6 +120,17 @@ bluetoothctl
 > connect 00:04:3E:88:EE:C0  # OBDLink MX+ MAC
 ```
 
+### Run Settings Server (Local Dev)
+```bash
+# Start server on claude-server
+python3 settings_server.py test
+
+# Access at http://10.0.0.99:8080
+# Edit settings, then push to gauge:
+rsync -avz config/settings.json claude@10.0.0.219:~/obd-gauge/config/
+ssh claude@10.0.0.219 "sudo reboot"
+```
+
 ## Related Documentation
 
 | Doc | Purpose |
@@ -143,4 +154,4 @@ Verify performance optimizations are in place (surface caching, batched writes)
 
 ---
 
-**Last Updated:** 2025-12-12
+**Last Updated:** 2025-12-17
