@@ -9,7 +9,7 @@ Complete guide to set up the OBD gauge display from scratch.
 | **SBC** | Raspberry Pi Zero 2W | Quad-core ARM Cortex-A53 @ 1GHz, 512MB RAM |
 | **Display** | HyperPixel 2.1 Round | 480x480 circular, DPI interface, capacitive touch |
 | **OBD Adapter** | OBDLink MX+ | Bluetooth Classic, supports 500kbps CAN |
-| **Power** | 5V 2A minimum | USB-C or micro-USB depending on Pi model |
+| **Power** | 5V 2A minimum | USB from vehicle or power bank |
 | **Storage** | 8GB+ microSD | Class 10 or faster recommended |
 
 ### Alternative OBD Adapters
@@ -24,7 +24,7 @@ Complete guide to set up the OBD gauge display from scratch.
 
 ### 1. Download Raspberry Pi OS
 
-Download **Raspberry Pi OS Lite (32-bit or 64-bit)** - Bullseye or newer.
+Download **Raspberry Pi OS Lite (64-bit)** - Bullseye or newer.
 
 Use Raspberry Pi Imager for easiest setup.
 
@@ -82,19 +82,47 @@ sudo usermod -aG sudo claude
 1. Power off Pi
 2. Attach HyperPixel HAT to 40-pin GPIO
 3. Secure with standoffs if available
+4. **Important**: Apply electrical tape over the bottom of the FPC ribbon cable / ground tab area to prevent it from shorting against the metal backing plate. Without this, the display will show resolution/interlacing artifacts.
 
 **Driver Configuration:**
 
-Edit `/boot/config.txt`:
+Edit `/boot/config.txt` to include these settings:
 ```ini
-# HyperPixel 2.1 Round display
-dtoverlay=hyperpixel2r
+# Disable camera/DSI auto-detect
+camera_auto_detect=0
+display_auto_detect=0
 
-# Disable kernel touch driver for Python access
+# Use Legacy GL Driver (FKMS) - REQUIRED for HyperPixel 2r
+# DO NOT use vc4-kms-v3d - it does not work with this display
+dtoverlay=vc4-fkms-v3d
+max_framebuffers=2
+
+# Run in 64-bit mode
+arm_64bit=1
+
+# Disable overscan compensation
+disable_overscan=1
+
+# HyperPixel 2.1 Round - disable kernel touch driver for Python I2C access
 dtoverlay=hyperpixel2r:disable-touch
 
-# Recommended for Pi Zero 2W
-gpu_mem=128
+[all]
+
+# DPI timing parameters - REQUIRED, do not remove any of these
+enable_dpi_lcd=1
+dpi_group=2
+dpi_mode=87
+dpi_output_format=0x7f216
+dpi_timings=480 0 10 16 55 480 0 15 60 15 0 0 0 60 0 19200000 6
+dtparam=i2c_arm=on
+
+# Disable onboard Bluetooth (using USB dongle or OBDLink MX+ directly)
+dtoverlay=disable-bt
+enable_uart=1
+core_freq=250
+
+# GPU memory - keep at 64 (Pi Zero 2W only has 512MB total)
+gpu_mem=64
 ```
 
 **Reboot:**
@@ -133,9 +161,6 @@ git clone https://github.com/pimoroni/hyperpixel2r-python
 cd hyperpixel2r-python
 sudo ./install.sh
 cd ..
-
-# OBD library (optional - we use native socket)
-pip3 install obd
 ```
 
 ## Application Installation
@@ -151,8 +176,8 @@ cd obd-gauge
 ### Verify Installation
 
 ```bash
-# Test run (will show error if OBD not connected)
-sudo SDL_FBDEV=/dev/fb0 python3 boost_gauge.py --demo
+# Test run (will show demo mode if OBD not connected)
+sudo SDL_FBDEV=/dev/fb0 SDL_VIDEODRIVER=fbcon python3 boost_gauge.py
 ```
 
 ## Bluetooth OBD Pairing
@@ -194,41 +219,32 @@ rc.local is more reliable:
 
 Edit `/etc/rc.local` (before `exit 0`):
 ```bash
-# Start OBD Gauge
-sleep 5
-SDL_FBDEV=/dev/fb0 /usr/bin/python3 /home/claude/obd-gauge/boost_gauge.py --fps 30 --obd 25 --smooth 0.25 &
+# Lock CPU to maximum frequency
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor > /dev/null
+
+# Wait for system services to settle
+sleep 10
+
+# Kill splash screen
+pkill fbi 2>/dev/null
+sleep 0.5
+
+# Kill any existing instances
+pkill -f boost_gauge.py 2>/dev/null
+
+# Unbind console from framebuffer
+echo 0 > /sys/class/vtconsole/vtcon1/bind 2>/dev/null
+
+# Start the gauge with high priority
+cd /home/claude/obd-gauge
+export SDL_VIDEODRIVER=fbcon
+export SDL_FBDEV=/dev/fb0
+nice -n -10 /usr/bin/python3 boost_gauge.py &
 ```
 
 Make executable:
 ```bash
 sudo chmod +x /etc/rc.local
-```
-
-### Using systemd (Alternative)
-
-Create `/etc/systemd/system/obd-gauge.service`:
-```ini
-[Unit]
-Description=OBD Gauge Display
-After=multi-user.target
-
-[Service]
-Type=simple
-User=root
-Environment=SDL_FBDEV=/dev/fb0
-ExecStart=/usr/bin/python3 /home/claude/obd-gauge/boost_gauge.py --fps 30
-Restart=on-failure
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Enable:
-```bash
-sudo systemctl daemon-reload
-sudo systemctl enable obd-gauge
-sudo systemctl start obd-gauge
 ```
 
 ### Disable Console on Display
@@ -250,10 +266,7 @@ sudo reboot
 ### Check Status
 
 ```bash
-# If using systemd
-sudo systemctl status obd-gauge
-
-# If using rc.local
+# Check if running
 ps aux | grep boost_gauge
 ```
 
@@ -269,8 +282,9 @@ ps aux | grep boost_gauge
 
 | Problem | Solution |
 |---------|----------|
-| Black screen | Check `/boot/config.txt` has `dtoverlay=hyperpixel2r` |
-| Garbled display | Framebuffer stride issue - code should handle this |
+| Black screen | Check `/boot/config.txt` has correct FKMS config (see above) |
+| Interlacing / resolution artifacts | Apply electrical tape over FPC ribbon contacts at bottom of display |
+| Garbled display | Framebuffer stride issue - code handles this automatically |
 | Terminal visible | Disable getty: `sudo systemctl disable getty@tty1` |
 
 ### Bluetooth Issues
@@ -285,29 +299,16 @@ ps aux | grep boost_gauge
 
 | Problem | Solution |
 |---------|----------|
-| Slow animations | Reduce FPS with `--fps 30` |
+| Low FPS | Check CPU governor is `performance` |
 | High CPU | Ensure surface caching is working |
-| Choppy needle | Adjust smoothing with `--smooth 0.25` |
-
-## Network Configuration (Optional)
-
-For reliable remote access, configure static IP:
-
-Edit `/etc/dhcpcd.conf`:
-```ini
-interface wlan0
-static ip_address=10.0.0.219/24
-static routers=10.0.0.1
-static domain_name_servers=10.0.0.1
-```
+| Choppy needle | Adjust smoothing in config/settings.json |
 
 ## Next Steps
 
-- `docs/hardware.md` - Detailed hardware information
+- `docs/hardware.md` - Detailed hardware information and display driver notes
 - `docs/BLUETOOTH_OBD_SETUP.md` - OBD connection troubleshooting
 - `docs/PERFORMANCE_OPTIMIZATION.md` - Animation tuning
-- `CONTRIBUTING.md` - Development workflow
 
 ---
 
-**Last Updated:** 2025-12-12
+**Last Updated:** 2026-02-04

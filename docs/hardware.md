@@ -5,8 +5,8 @@
 | Property | Value |
 |----------|-------|
 | **Hostname** | claude-go |
-| **IP Address** | 10.0.0.219 |
-| **SSH** | `ssh claude@10.0.0.219` (passwordless from claude-server) |
+| **IP Address** | DHCP (check router for current IP) |
+| **SSH** | `ssh claude@<ip>` (passwordless from claude-server) |
 | **OS** | Debian 11 (bullseye) / Raspberry Pi OS |
 | **Architecture** | aarch64 (ARM64) |
 
@@ -22,31 +22,68 @@
 - **Virtual FB**: 720x480 pixels (requires stride padding when writing raw)
 - **Shape**: Circular (2.1" diameter)
 - **Refresh**: 60 Hz
-- **Interface**: DPI (parallel RGB)
+- **Interface**: DPI (parallel RGB, ~19 MHz signal)
 - **Touch**: Capacitive touchscreen (I2C, requires `disable-touch` overlay for Python access)
 - **Framebuffer**: /dev/fb0 (RGB565, 16bpp)
 
 ### OBDLink MX+ Adapter
+- **MAC**: 00:04:3E:88:EE:C0
+- **PIN**: 1234
 - **Connection**: Bluetooth Classic (SPP)
 - **Supported Protocols**: All OBD-II (CAN, ISO, VPW, PWM)
 - **Data Rate**: 20-30 Hz single PID
 
 ## Display Configuration
 
-### /boot/config.txt
+### /boot/config.txt (Known-Good)
 ```ini
-# HyperPixel 2.1 Round
-dtoverlay=hyperpixel2r
+# Use Legacy GL Driver (FKMS) - REQUIRED for HyperPixel 2r
+# DO NOT switch to KMS (vc4-kms-v3d) - it does not work with this display
+dtoverlay=vc4-fkms-v3d
+max_framebuffers=2
 
-# Disable touch driver for Python access
+# HyperPixel 2.1 Round - disable kernel touch driver for Python I2C access
 dtoverlay=hyperpixel2r:disable-touch
+
+# DPI timing parameters - REQUIRED, do not remove
+enable_dpi_lcd=1
+dpi_group=2
+dpi_mode=87
+dpi_output_format=0x7f216
+dpi_timings=480 0 10 16 55 480 0 15 60 15 0 0 0 60 0 19200000 6
+dtparam=i2c_arm=on
+gpu_mem=64
 ```
 
 ### SDL Environment
 ```bash
 export SDL_FBDEV=/dev/fb0
-export SDL_VIDEODRIVER=fbcon
+export SDL_VIDEODRIVER=fbcon    # DO NOT change to 'dummy'
 ```
+
+**Critical**: `SDL_VIDEODRIVER` must be `fbcon`. Changing to `dummy` breaks pygame's native fullscreen display management.
+
+## Display Driver Notes
+
+### FKMS vs KMS
+
+This project uses **FKMS** (`vc4-fkms-v3d`), NOT KMS (`vc4-kms-v3d`).
+
+| Driver | Status | Notes |
+|--------|--------|-------|
+| `vc4-fkms-v3d` | **Working** | Legacy driver, uses manual DPI timings in config.txt |
+| `vc4-kms-v3d` | **Broken** | Does not work with HyperPixel 2r on Pi Zero 2W |
+| `vc4-kms-dpi-hyperpixel2r` | **Broken** | KMS overlay, incompatible |
+
+### Resolution / Signal Integrity Fix
+
+The HyperPixel 2.1 Round can exhibit resolution/alignment artifacts that look like interlacing. This is a **hardware issue**, not software.
+
+**Cause**: The FPC ribbon cable contacts at the bottom of the display can short against the LCD's metal backing plate, causing signal interference on the ~19 MHz DPI parallel lines.
+
+**Fix**: Apply electrical tape over the bottom of the FPC ribbon / ground tab area to insulate it from the metal backing plate. This restores full 480x480 resolution.
+
+This has been confirmed on two separate screens - same issue, same fix.
 
 ## Pygame Optimization
 
@@ -58,11 +95,11 @@ pygame.display.set_mode(
 )
 ```
 
-### Driver Selection (in order of preference)
-1. `kmsdrm` - Kernel Mode Setting (best performance)
-2. `fbcon` - Framebuffer console
-3. `directfb` - DirectFB layer
-4. `dummy` + raw FB write - Fallback
+### Driver Selection
+The app uses `fbcon` exclusively. Other drivers are not supported:
+- `fbcon` - Framebuffer console (the working driver)
+- `kmsdrm` - Does not work with HyperPixel 2r FKMS config
+- `dummy` - Breaks native pygame display management
 
 ## Power Requirements
 
@@ -76,12 +113,12 @@ pygame.display.set_mode(
 - 40-pin GPIO completely occupied by HyperPixel
 - I2C available for touch (if overlay enabled)
 - USB for power and optional OBD cable (if not BT)
+- **Important**: Ensure FPC ribbon contacts at bottom of display do not touch the metal backing plate (insulate with electrical tape)
 
 ## Thermal Notes
 
 - Pi Zero 2W runs hot under sustained load
-- 30 FPS @ 44% CPU is sustainable without heatsink
-- 60 FPS @ 60% CPU may need passive cooling
+- 60 FPS @ ~60% CPU is sustainable without heatsink (CPU governor set to `performance`)
 - Enclosure should allow airflow
 
 ## Touchscreen Setup
@@ -159,3 +196,7 @@ with open('/dev/fb0', 'wb') as fb:
 ```
 
 Without this fix, the display appears garbled/scrunched with terminal bleeding through.
+
+---
+
+**Last Updated:** 2026-02-04

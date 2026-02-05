@@ -12,19 +12,20 @@ Optimized for 2016 Audi RS7 with OBDLink MX+ adapter.
 | **Display** | HyperPixel 2.1 Round (480x480) |
 | **OBD Adapter** | OBDLink MX+ (Bluetooth) |
 | **Vehicle** | 2016 Audi RS7 4.0T (500kbps CAN) |
+| **Power** | USB from vehicle (no battery) |
 
 ## Deployment
 
-**Target Device**: claude-go (10.0.0.219)
+**Target Device**: claude-go (DHCP)
 
 ### Auto-Start on Boot
 
 The gauge starts automatically via `/etc/rc.local`:
 
 ```bash
-# Start OBD Gauge
-sleep 5
-SDL_FBDEV=/dev/fb0 /usr/bin/python3 /home/claude/obd-gauge/boost_gauge.py --fps 30 --obd 25 --smooth 0.25 &
+# CPU governor set to performance
+# SDL environment configured
+# Gauge launched with nice -n -10
 ```
 
 **Note**: systemd service had issues with SIGHUP when pygame uses fbcon driver. rc.local works reliably.
@@ -32,39 +33,37 @@ SDL_FBDEV=/dev/fb0 /usr/bin/python3 /home/claude/obd-gauge/boost_gauge.py --fps 
 ### Manual Run
 
 ```bash
-sudo SDL_FBDEV=/dev/fb0 python3 boost_gauge.py --fps 30 --obd 25 --smooth 0.25
+sudo SDL_FBDEV=/dev/fb0 SDL_VIDEODRIVER=fbcon python3 boost_gauge.py
 ```
 
 ## Features
 
-- Animated needle with smooth tweening
+- 60 FPS animated needle with smooth tweening
 - Color-coded arcs (vacuum blue / boost green-red)
 - Digital PSI readout
 - FPS counter for performance monitoring
 - Touchscreen swipe gestures (left/right/up/down + tap)
-- Screen carousel with 5 screens (swipe to navigate)
-- Screen indicator dots at bottom
+- Screen carousel with multiple screens (swipe to navigate)
+- RS7-specific boost and temperature calibration
 
 ## Navigation (2D Grid)
 
-The UI uses a 2D grid navigation system:
-
 ```
          Row 0 (Gauges)
-    ┌─────┬─────┬─────┐
-    │Boost│Temp │Load │  ← Swipe LEFT/RIGHT
-    │ PSI │ °F  │  %  │
-    └─────┴─────┴─────┘
-           ↑ Swipe UP
-           ↓ Swipe DOWN
-    ┌─────────────────┐
-    │  QR / Settings  │  Row 1
-    └─────────────────┘
-           ↑ Swipe UP
-           ↓ Swipe DOWN
-    ┌─────────────────┐
-    │     SYSTEM      │  Row 2 (Demo Mode, Power)
-    └─────────────────┘
+    +-----+-----+-----+
+    |Boost|Temp |Load |  <- Swipe LEFT/RIGHT
+    | PSI | F   |  %  |
+    +-----+-----+-----+
+           ^ Swipe UP
+           v Swipe DOWN
+    +-----------------+
+    |  QR / Settings  |  Row 1
+    +-----------------+
+           ^ Swipe UP
+           v Swipe DOWN
+    +-----------------+
+    |     SYSTEM      |  Row 2 (Demo Mode, Power)
+    +-----------------+
 ```
 
 | Gesture | Row 0 (Gauges) | Row 1 (Settings) | Row 2 (System) |
@@ -80,9 +79,9 @@ The UI uses a 2D grid navigation system:
 ### Row 0: Gauges
 | Col | Gauge | Range | Color Zones |
 |-----|-------|-------|-------------|
-| 0 | Boost Pressure | -15 to +25 PSI | Blue (vacuum) → Green → Red (boost) |
-| 1 | Coolant Temp | 100-260°F | Blue (cold) → Green (normal) → Red (hot) |
-| 2 | Engine Load | 0-100% | Blue (idle) → Green (normal) → Red (heavy) |
+| 0 | Boost Pressure | -15 to +25 PSI | Blue (vacuum) -> Green -> Red (boost) |
+| 1 | Coolant Temp | 100-260 F | Blue (cold) -> Green (normal) -> Red (hot) |
+| 2 | Engine Load | 0-100% | Blue (idle) -> Green (normal) -> Red (heavy) |
 
 ### Row 1: Settings / QR
 - QR code for WiFi connection (phone auto-connects to gauge hotspot)
@@ -99,10 +98,12 @@ The UI uses a 2D grid navigation system:
 
 | File | Purpose |
 |------|---------|
-| `boost_gauge.py` | Main boost gauge display |
-| `display.py` | Pygame display wrapper |
+| `boost_gauge.py` | Main gauge display (~3300 lines) |
+| `obd_socket.py` | Native Bluetooth OBD2 connection |
 | `touch.py` | Touch gesture handler |
+| `display.py` | Pygame display wrapper |
 | `start.sh` | Wrapper script (sets SDL env vars) |
+| `start_gauge.sh` | Boot startup script |
 | `config/settings.json` | Gauge configuration |
 
 ## Configuration
@@ -110,25 +111,19 @@ The UI uses a 2D grid navigation system:
 `config/settings.json`:
 ```json
 {
-  "gauge": {
-    "min_psi": -15,
-    "max_psi": 25,
-    "smoothing": 0.25
-  },
-  "display": {
-    "fps": 30,
-    "brightness": 100
-  },
-  "obd": {
-    "rate_hz": 25,
-    "device": "/dev/rfcomm0"
-  }
+  "gauges": [
+    {"position": 0, "pid": "THROTTLE_POS", "label": "THROTTLE", "min": 0, "max": 100},
+    {"position": 1, "pid": "COOLANT_TEMP", "label": "COOLANT", "min": 100, "max": 260},
+    {"position": 2, "pid": "BOOST", "label": "BOOST", "min": -20, "max": 30}
+  ],
+  "display": {"fps": 60, "smoothing": 0.25, "dial_background": "audi"},
+  "obd": {"rate_hz": 25, "bt_device_mac": "00:04:3E:88:EE:C0"}
 }
 ```
 
 ## Settings Web Server
 
-The gauge can be configured via a web interface. Two access methods:
+The gauge can be configured via a web interface:
 
 ### Method 1: On-Device Hotspot (In Car)
 
@@ -139,8 +134,6 @@ The gauge can be configured via a web interface. Two access methods:
 
 ### Method 2: Local Network (Development)
 
-Run the settings server on any machine with the repo:
-
 ```bash
 # Start server (binds to 0.0.0.0:8080)
 python3 settings_server.py test
@@ -149,49 +142,30 @@ python3 settings_server.py test
 # http://<server-ip>:8080
 ```
 
-**Development workflow (claude-server):**
-```bash
-# 1. Start settings server locally
-python3 settings_server.py test
-
-# 2. Edit settings at http://10.0.0.99:8080
-
-# 3. Push changes to gauge
-rsync -avz config/settings.json claude@10.0.0.219:~/obd-gauge/config/
-
-# 4. Restart gauge to apply
-ssh claude@10.0.0.219 "sudo reboot"
-```
-
-**Note**: Firewall must allow port 8080 (`sudo ufw allow 8080/tcp`)
-
-## Command Line Options
-
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--fps` | 30 | Display refresh rate |
-| `--obd` | 25 | OBD2 data rate (Hz) |
-| `--smooth` | 0.25 | Needle smoothing (0.1-0.3) |
-
 ## Performance
 
-At `--fps 30 --obd 25`:
-- CPU: ~35% (pygame 1.9.6 on Pi Zero 2W)
-- FPS: 30.1-30.3 (stable)
+At 60 FPS with CPU governor set to `performance`:
+- CPU: ~60% (Pi Zero 2W)
+- FPS: 59.8-60.2 (stable)
 - Smooth needle animation
 - Minimal input lag
+
+Key optimizations:
+- Surface caching for static elements
+- Pre-rendered hub surface
+- Batched framebuffer writes (single write per frame)
 
 ## Documentation
 
 ### Getting Started
-- `INSTALL.md` - **Complete installation guide** (start here for new setup)
-- `CONTRIBUTING.md` - Development workflow and code structure
+- `INSTALL.md` - Complete installation guide
+- `CONTRIBUTING.md` - Development workflow
 - `CLAUDE.md` - Context for Claude Code sessions
 
 ### Technical Docs
+- `docs/hardware.md` - Hardware details, display driver config, resolution fix
 - `docs/BLUETOOTH_OBD_SETUP.md` - Bluetooth OBD pairing and troubleshooting
 - `docs/PERFORMANCE_OPTIMIZATION.md` - Animation & performance learnings
-- `docs/hardware.md` - Pi Zero 2W + HyperPixel hardware details
 - `docs/obd-optimization.md` - OBD2 data rates and tweening
 
 ## Dependencies
@@ -199,103 +173,47 @@ At `--fps 30 --obd 25`:
 ```
 pygame>=2.0.0
 hyperpixel2r>=0.0.1
-obd>=0.7.1
 ```
 
 **Note**: System pygame 1.9.6 works fine. Pip-installed 2.6.1 also available.
 
 ## Known Issues / Gotchas
 
+### HyperPixel 2r Resolution / Interlacing Artifacts
+
+**Problem**: Display shows interlacing-like artifacts, not rendering at full 480x480.
+
+**Cause**: FPC ribbon cable contacts at bottom of display short against the metal backing plate, causing signal interference on the ~19 MHz DPI lines.
+
+**Fix**: Apply electrical tape over the bottom of the FPC ribbon / ground tab area to insulate from the metal backing plate. Confirmed on two separate screens.
+
 ### pygame 2.6.1 `border_radius` Keyword Bug
 
-**Problem**: `pygame.draw.rect()` with `border_radius=N` keyword argument crashes on Pi's pygame 2.6.1:
-```python
-# CRASHES with: TypeError: rect() takes no keyword arguments
-pygame.draw.rect(screen, color, rect, border_radius=14)
-```
+**Problem**: `pygame.draw.rect()` with `border_radius=N` keyword argument crashes on Pi's pygame 2.6.1.
 
-**Solution**: Use the `_draw_capsule()` helper method that draws rounded rectangles using gfxdraw circles + rectangles:
-```python
-# Works on all pygame versions
-self._draw_capsule(color, rect)           # Filled
-self._draw_capsule(color, rect, 2)        # Outline only
-```
-
-**Note**: This affects pygame 2.6.1 on Raspberry Pi OS. Desktop pygame may support `border_radius`.
+**Solution**: Use the `_draw_capsule()` helper method.
 
 ### HyperPixel 2r Brightness
 
 The HyperPixel 2r has a **binary backlight** (on/off via GPIO) with no PWM dimming. The app uses software dimming via a semi-transparent overlay instead.
 
+### Display Driver Compatibility
+
+**FKMS only.** KMS (`vc4-kms-v3d`) and its associated overlay (`vc4-kms-dpi-hyperpixel2r`) do not work with the HyperPixel 2r on Pi Zero 2W. See `docs/hardware.md` for details.
+
 ## Current Status
 
-- [x] Gauge display working
+- [x] 60 FPS gauge display with smooth animation
+- [x] Full 480x480 resolution (with electrical tape fix)
 - [x] Auto-start on boot (rc.local)
-- [x] Cleaned up RPi5 cruft
-- [x] Touchscreen swipe gestures working
-- [x] Screen carousel (swipe left/right to switch screens)
-- [x] Display rendering correctly on 480x480 circular screen
-- [x] 2D grid navigation (gauges row + settings row)
+- [x] Touchscreen swipe gestures
+- [x] 2D grid navigation (gauges + settings + system rows)
 - [x] 3 gauge screens (Boost, Coolant Temp, Engine Load)
-- [x] Generic gauge renderer with color zones
-- [x] Settings screen UI
-- [x] WiFi hotspot mode (tap to start, phone connects)
-- [x] Web-based settings page (192.168.4.1:8080)
-- [x] **OBD2 Bluetooth connection** - Working with OBDLink MX+ (native socket)
-- [x] **Real data from OBD2 PIDs** - Throttle, Boost (MAP), Coolant Temp, RPM
-- [ ] Settings save/load (partially working)
-
-## Changelog
-
-### 2025-12-10 (Evening) - Milestone: OBD2 Bluetooth Working!
-- **OBD2 Bluetooth connection fully operational** with OBDLink MX+
-- Fixed fast query timeout (0.1s→0.3s) - was causing immediate disconnect after connection
-- Fixed `query_fast()` method placement (was outside class)
-- Analyzed aa-torque repo for performance optimization techniques
-- Added comprehensive documentation:
-  - `docs/BLUETOOTH_OBD_SETUP.md` - Complete setup and troubleshooting guide
-  - `docs/PERFORMANCE_OPTIMIZATION.md` - Animation learnings from aa-torque
-- Key insight: Animation duration should match data refresh rate for smooth gauges
-- Achieved ~5.2 Hz effective polling rate with prioritized throttle queries
-- Remaining ~100-300ms delay is inherent Bluetooth SPP latency
-
-### 2025-12-07 (Evening) - Milestone: WiFi Hotspot + Web Settings Working
-- **WiFi hotspot mode working!** Tap on Settings screen to start/stop
-- **Web settings page accessible** at 192.168.4.1:8080 from phone
-- Fixed Python import path issue - modules weren't found when run via rc.local
-- Added `sys.path.insert()` to ensure sibling modules load regardless of working directory
-- Phone now prompted to "Connect Anyway" (no internet) which is expected behavior
-
-### 2025-12-07 (Afternoon) - System Screen + pygame Compatibility Fix
-- **Fixed pygame 2.6.1 crash** - `border_radius` keyword not supported on Pi
-- Added `_draw_capsule()` helper for pygame-compatible rounded rectangles
-- **System screen (Row 2)** now renders correctly with Demo Mode toggle
-- Added 500ms navigation cooldown to prevent accidental power button taps after swipe
-- Added pending action pattern for clean reboot/shutdown (executes after pygame.quit())
-- Fixed reboot button freeze bug
-
-### 2025-12-06 (Evening) - Milestone: 2D Grid Navigation + Multi-Gauge
-- **2D grid navigation system** - Row 0 for gauges, Row 1 for settings
-- **3 working gauges**: Boost PSI, Coolant Temp, Engine Load
-- **Generic gauge renderer** with customizable ranges and color zones
-- **Settings screen** with PID selection UI (placeholder)
-- Swipe UP/DOWN to switch between gauges and settings rows
-- Swipe LEFT/RIGHT to navigate within a row
-- All gauges animate with smooth needle tweening
-- Simulated data for testing (boost cycle, temp fluctuation, load response)
-
-### 2025-12-06 (Afternoon) - Milestone: Touchscreen Working
-- **Touchscreen working!** Swipe left/right/up/down and tap all detected correctly
-- Fixed gesture detection bug: was resetting touch start on every drag event
-- Fixed framebuffer stride issue: 720x480 virtual vs 480x480 physical display
-- Touch uses `hyperpixel2r` library with `disable-touch` overlay for Python I2C access
-
-### 2025-12-06
-- Removed Pi 5 / claude-zero leftovers (opencv, Pillow, psutil, camera config)
-- Deployed to claude-go (10.0.0.219)
-- Fixed auto-start: switched from systemd to rc.local (fbcon + systemd = SIGHUP issues)
-- Disabled getty@tty1 to prevent console interference
-- Verified boot-to-gauge in under 10 seconds
+- [x] OBD2 Bluetooth connection (OBDLink MX+, native socket)
+- [x] RS7 boost and temperature calibration
+- [x] WiFi hotspot mode with QR code
+- [x] Web-based settings page
+- [x] Demo mode for testing without OBD connection
 
 ## License
 

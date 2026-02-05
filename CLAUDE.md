@@ -9,24 +9,34 @@ Optimized for 2016 Audi RS7 with OBDLink MX+ Bluetooth adapter.
 
 | Property | Value |
 |----------|-------|
-| **Target Device** | claude-go (10.0.0.219) |
+| **Target Device** | claude-go (DHCP - check router for IP) |
 | **Dev Server** | claude-server (10.0.0.99) |
-| **Main File** | `boost_gauge.py` (~2800 lines) |
+| **Main File** | `boost_gauge.py` (~3300 lines) |
 | **Config** | `config/settings.json` |
 | **Auto-start** | `/etc/rc.local` (systemd has SIGHUP issues with fbcon) |
+| **Display Driver** | FKMS (`vc4-fkms-v3d`) - DO NOT use KMS |
+| **SDL Driver** | `fbcon` - DO NOT change to `dummy` |
+
+## Hardware
+
+| Component | Details |
+|-----------|---------|
+| **SBC** | Raspberry Pi Zero 2W (512MB RAM) |
+| **Display** | HyperPixel 2.1 Round (480x480, DPI interface) |
+| **OBD** | OBDLink MX+ (BT MAC: 00:04:3E:88:EE:C0, PIN: 1234) |
+| **Vehicle** | 2016 Audi RS7 4.0T (500kbps CAN) |
+
+No battery (PiSugar removed). Powered via USB from vehicle.
 
 ## Deployment Workflow
 
 ```bash
 # From claude-server (10.0.0.99)
 rsync -avz --exclude '.git' --exclude '__pycache__' \
-  /home/claude/obd-gauge/ claude@10.0.0.219:~/obd-gauge/
+  /home/claude/obd-gauge/ claude@<device-ip>:~/obd-gauge/
 
 # Restart the gauge app
-ssh claude@10.0.0.219 "sudo systemctl restart obd-gauge"
-
-# Or for manual testing
-ssh claude@10.0.0.219 "sudo SDL_FBDEV=/dev/fb0 python3 ~/obd-gauge/boost_gauge.py"
+ssh claude@<device-ip> "sudo reboot"
 ```
 
 ## Architecture
@@ -37,12 +47,24 @@ obd_socket.py      - Native Bluetooth OBD2 connection (not python-obd library)
 touch.py           - Gesture detection wrapper for hyperpixel2r
 display.py         - Pygame initialization helpers
 gauges.py          - Gauge configuration classes
-conversions.py     - Unit conversions (kPa→PSI, C→F)
+conversions.py     - Unit conversions (kPa->PSI, C->F)
 hotspot.py         - WiFi hotspot management
 settings_server.py - Web-based settings UI
 ```
 
+## Critical: Do NOT Change
+
+1. **Display driver**: Must be `vc4-fkms-v3d` (FKMS). KMS (`vc4-kms-v3d`) does not work.
+2. **SDL_VIDEODRIVER**: Must be `fbcon`. `dummy` breaks pygame display management.
+3. **DPI timings**: The `dpi_timings` line in config.txt is required. Do not remove.
+4. **gpu_mem**: Keep at 64. Pi Zero 2W only has 512MB total.
+
+See `docs/hardware.md` for the full known-good `/boot/config.txt`.
+
 ## Key Technical Quirks
+
+### Display Resolution Fix (Hardware)
+The HyperPixel 2.1 Round can show resolution/interlacing artifacts. This is caused by FPC ribbon contacts shorting against the metal backing plate. Fix: electrical tape over the bottom contacts. See `docs/hardware.md` for details.
 
 ### Framebuffer Stride Issue
 The HyperPixel 2r has a 720x480 virtual framebuffer but 480x480 physical display:
@@ -65,11 +87,12 @@ dtoverlay=hyperpixel2r:disable-touch
 
 ## Performance Optimizations (Critical)
 
-These optimizations were added to achieve 60 FPS:
+These optimizations achieve 60 FPS:
 
 1. **Surface Caching** (`_label_cache`) - Perimeter labels pre-rendered once
 2. **Pre-rendered Hub** (`_hub_surface`) - Center circle drawn once, blitted each frame
 3. **Batched FB Writes** (`_fb_buffer`) - Single write instead of 480 row writes
+4. **CPU Governor** - Set to `performance` in rc.local
 
 ```python
 # Key methods for performance
@@ -115,27 +138,16 @@ Row 2: System (Demo mode, Brightness, Shutdown)
 
 ### Debug OBD Connection
 ```bash
-ssh claude@10.0.0.219
+ssh claude@<device-ip>
 bluetoothctl
 > connect 00:04:3E:88:EE:C0  # OBDLink MX+ MAC
-```
-
-### Run Settings Server (Local Dev)
-```bash
-# Start server on claude-server
-python3 settings_server.py test
-
-# Access at http://10.0.0.99:8080
-# Edit settings, then push to gauge:
-rsync -avz config/settings.json claude@10.0.0.219:~/obd-gauge/config/
-ssh claude@10.0.0.219 "sudo reboot"
 ```
 
 ## Related Documentation
 
 | Doc | Purpose |
 |-----|---------|
-| `docs/hardware.md` | Pi Zero 2W + HyperPixel setup, framebuffer details |
+| `docs/hardware.md` | Pi Zero 2W + HyperPixel setup, display fix, framebuffer details |
 | `docs/BLUETOOTH_OBD_SETUP.md` | Complete OBD pairing and troubleshooting |
 | `docs/PERFORMANCE_OPTIMIZATION.md` | Animation timing learnings from aa-torque |
 | `INSTALL.md` | Fresh installation guide |
@@ -143,15 +155,20 @@ ssh claude@10.0.0.219 "sudo reboot"
 
 ## Troubleshooting
 
-### Pi shows 169.254.x.x IP (DHCP failure)
-Configure static IP in `/etc/dhcpcd.conf` on the Pi
+### Display shows interlacing / resolution artifacts
+Apply electrical tape over FPC ribbon contacts at bottom of display. See `docs/hardware.md`.
 
 ### App won't start / black screen
-Check framebuffer: `cat /dev/urandom > /dev/fb0` should show noise
+Check framebuffer: `cat /dev/urandom > /dev/fb0` should show noise on display.
 
 ### Slow animations
-Verify performance optimizations are in place (surface caching, batched writes)
+Verify performance optimizations are in place (surface caching, batched writes). Check CPU governor is `performance`.
+
+## Backups
+
+- `backups/claude-go-20260120/` - Jan 20, 2026 known-good state (boot config, rc.local, full app)
+- `backups/claude-go-20260204/` - Feb 4, 2026 pre-session state
 
 ---
 
-**Last Updated:** 2025-12-17
+**Last Updated:** 2026-02-04
