@@ -501,17 +501,18 @@ class BoostGaugeTest:
         Performance optimization: drawing filled circles with gfxdraw is slow.
         Pre-rendering once and blitting is much faster.
         """
-        hub_radius = 70
-        size = hub_radius * 2 + 4  # Add margin for anti-aliasing
-        self._hub_surface = pygame.Surface((size, size), pygame.SRCALPHA)
+        hub_radius = 60
+        size = hub_radius * 2 + 4
+        colorkey = (255, 0, 255)
+        self._hub_surface = pygame.Surface((size, size))
+        self._hub_surface.fill(colorkey)
+        self._hub_surface.set_colorkey(colorkey)
 
         center = size // 2
-        # Outer charcoal circle
-        gfxdraw.aacircle(self._hub_surface, center, center, hub_radius, self.AUDI_CHARCOAL)
-        gfxdraw.filled_circle(self._hub_surface, center, center, hub_radius, self.AUDI_CHARCOAL)
-        # Inner red accent
-        gfxdraw.aacircle(self._hub_surface, center, center, 15, self.AUDI_RED)
-        gfxdraw.filled_circle(self._hub_surface, center, center, 15, self.AUDI_RED)
+        # Outer charcoal circle - fully opaque, no alpha blending
+        pygame.draw.circle(self._hub_surface, self.AUDI_CHARCOAL, (center, center), hub_radius)
+        # Inner red accent - fully opaque
+        pygame.draw.circle(self._hub_surface, self.AUDI_RED, (center, center), 15)
 
         self._hub_offset = center  # For centering when blitting
         print(f"[Perf] Pre-rendered hub surface ({size}x{size})")
@@ -1719,7 +1720,7 @@ class BoostGaugeTest:
 
         # Unit label
         unit_surface = self._font_small.render("PSI", True, self.WHITE)
-        unit_rect = unit_surface.get_rect(center=(240, 375))
+        unit_rect = unit_surface.get_rect(center=(240, 399))
         self.screen.blit(unit_surface, unit_rect)
 
     def _draw_fps(self):
@@ -2013,11 +2014,7 @@ class BoostGaugeTest:
             hub_y = self.center[1] - self._hub_offset
             self.screen.blit(self._hub_surface, (hub_x, hub_y))
 
-        # Digital readout - Audi MMI style
-        pygame.draw.rect(self.screen, self.AUDI_CHARCOAL, (170, 300, 140, 60))
-        pygame.draw.rect(self.screen, self.AUDI_DIVIDER, (170, 300, 140, 60), 2)
-
-        # Use indicator_color (already computed above) for digital readout
+        # Digital readout
         text = f"{value:.1f}"  # Always show 1 decimal place
         val_surface = self._font_medium.render(text, True, indicator_color)
         val_rect = val_surface.get_rect(center=(240, 330))
@@ -2025,7 +2022,7 @@ class BoostGaugeTest:
 
         # Unit and title - Audi MMI style
         unit_surface = self._font_small.render(unit, True, self.AUDI_GRAY)
-        unit_rect = unit_surface.get_rect(center=(240, 375))
+        unit_rect = unit_surface.get_rect(center=(240, 399))
         self.screen.blit(unit_surface, unit_rect)
 
         title_surface = self._font_small.render(title, True, self.AUDI_WHITE)
@@ -2162,7 +2159,7 @@ class BoostGaugeTest:
         """Get display unit for a PID."""
         pid_upper = pid.upper()
         if "TEMP" in pid_upper:
-            return "°F" if conversion == "c_to_f" else "°C"
+            return "°F"
         elif "BOOST" in pid_upper or "PRESSURE" in pid_upper:
             return "PSI"
         elif "RPM" in pid_upper:

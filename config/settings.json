@@ -21,6 +21,11 @@
       "max": 260,
       "radial_bars": [
         {
+          "start": 145,
+          "end": 180,
+          "color": "orange"
+        },
+        {
           "start": 180,
           "end": 220,
           "color": "green"
