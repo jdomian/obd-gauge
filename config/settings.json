@@ -51,7 +51,8 @@
     "dial_background": "audi",
     "demo_mode": false,
     "show_fps": false,
-    "animated_transitions": true
+    "animated_transitions": true,
+    "default_gauge": 1
   },
   "obd": {
     "rate_hz": 60,

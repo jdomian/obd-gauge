@@ -192,6 +192,10 @@ class BoostGaugeTest:
         self.row_cols = [4, 1, 1, 1]  # Number of columns per row
         self.num_rows = 4    # 4 rows (gauges + bluetooth + wifi/settings + system)
 
+        # Apply default gauge from settings (after screen_col init)
+        if hasattr(self, 'default_gauge') and self.default_gauge < len(self.gauge_configs):
+            self.screen_col = self.default_gauge
+
         # Screen transition animation state
         self._transition_state = 'idle'  # 'idle', 'dragging', 'animating'
         self._transition_offset = 0.0    # Current pixel offset (-480 to 480)
@@ -411,8 +415,9 @@ class BoostGaugeTest:
                 self.show_fps = display.get("show_fps", False)
                 self.dial_background = display.get("dial_background", "default")
                 self.animated_transitions = display.get("animated_transitions", True)
+                self.default_gauge = display.get("default_gauge", 0)
 
-                print(f"[Settings] Display: fps={self.target_fps}, demo={self.demo_mode}, show_fps={self.show_fps}, dial={self.dial_background}")
+                print(f"[Settings] Display: fps={self.target_fps}, demo={self.demo_mode}, show_fps={self.show_fps}, dial={self.dial_background}, default_gauge={self.default_gauge}")
 
                 # Load OBD settings
                 obd = settings.get("obd", {})
@@ -422,6 +427,11 @@ class BoostGaugeTest:
                 # Row 0: Gauges (+ shift light), Row 1: Bluetooth, Row 2: WiFi/Settings, Row 3: System
                 num_gauges = len(self.gauge_configs)
                 self.row_cols = [num_gauges + 1, 1, 1, 1]  # 4 rows now
+
+                # Set startup gauge position
+                if hasattr(self, 'default_gauge') and self.default_gauge < num_gauges:
+                    self.screen_col = self.default_gauge
+                    print(f"[Settings] Starting on gauge {self.default_gauge}")
 
         except Exception as e:
             print(f"[Settings] Failed to load settings: {e}")
@@ -1248,8 +1258,24 @@ class BoostGaugeTest:
             elif y >= 240 and y <= 275:
                 # Brightness slider area (shifted down)
                 self._handle_brightness_drag(x, y)
-            elif y >= 355 and y <= 410:
-                # Power button area (shifted down)
+            elif y >= 305 and y <= 340:
+                # Default gauge selector area
+                if self.gauge_configs:
+                    self.default_gauge = (self.default_gauge + 1) % len(self.gauge_configs)
+                    print(f"Default gauge: {self.default_gauge} ({self.gauge_configs[self.default_gauge].get('label', '?')})")
+                    # Save to config
+                    try:
+                        settings_path = os.path.join(os.path.dirname(__file__), "config", "settings.json")
+                        with open(settings_path, 'r') as f:
+                            settings = json.load(f)
+                        settings.setdefault("display", {})["default_gauge"] = self.default_gauge
+                        with open(settings_path, 'w') as f:
+                            json.dump(settings, f, indent=2)
+                        print(f"[Settings] Saved default_gauge={self.default_gauge}")
+                    except Exception as e:
+                        print(f"[Settings] Failed to save default gauge: {e}")
+            elif y >= 370 and y <= 420:
+                # Power button area
                 if time.time() < self._nav_cooldown:
                     print(f"Tap ignored (cooldown active)")
                     return
@@ -1795,7 +1821,7 @@ class BoostGaugeTest:
             gfxdraw.aacircle(self.screen, row_indicator_x, y, 4, color)
             gfxdraw.filled_circle(self.screen, row_indicator_x, y, 4, color)
 
-    def _draw_generic_gauge(self, value, min_val, max_val, unit, title, color_zones=None, center_value=None, show_minor_numbers=True, show_minor_ticks=True, radial_bars=None, indicator_style="needle"):
+    def _draw_generic_gauge(self, value, min_val, max_val, unit, title, color_zones=None, center_value=None, show_minor_numbers=True, show_minor_ticks=True, radial_bars=None, indicator_style="needle", pid=None):
         """Draw a generic gauge with customizable range and colors.
 
         Supports hybrid rendering: image background + procedural overlays.
@@ -1984,10 +2010,26 @@ class BoostGaugeTest:
 
         if indicator_style == "arc":
             # ARC INDICATOR: Animated radial arc from min to current value
-            # Draw arc from start angle to current value angle
-            # Color changes based on current value's zone
             arc_radius = 210  # Same position as major ticks
             arc_thickness = 30  # Thicker arc bar
+
+            # Boost gauge cold engine logic: override color based on oil temp
+            if pid == "BOOST":
+                oil_temp = self.simulated_values.get('OIL_TEMP', 0)
+                if oil_temp < 145:
+                    # Cold engine - blue warning
+                    indicator_color = self.BLUE
+                elif value <= 0:
+                    # Warmed up, vacuum - white
+                    indicator_color = self.AUDI_WHITE
+                else:
+                    # Warmed up, positive boost - orange to red
+                    boost_pct = value / max_val if max_val > 0 else 0
+                    r = min(255, int(255))
+                    g = max(0, int(165 * (1 - boost_pct)))
+                    b = 0
+                    indicator_color = (r, g, b)
+
             self._draw_arc(self.center, arc_radius, gauge_start_angle, angle, indicator_color, arc_thickness)
         else:
             # NEEDLE INDICATOR: Traditional thin tapered needle
@@ -2028,6 +2070,13 @@ class BoostGaugeTest:
         title_surface = self._font_small.render(title, True, self.AUDI_WHITE)
         title_rect = title_surface.get_rect(center=(240, 105))
         self.screen.blit(title_surface, title_rect)
+
+        # Default gauge indicator - small dot to the right of title
+        if hasattr(self, 'default_gauge') and self.screen_col == self.default_gauge:
+            dot_x = title_rect.right + 8
+            dot_y = title_rect.centery
+            gfxdraw.aacircle(self.screen, dot_x, dot_y, 3, self.AUDI_RED)
+            gfxdraw.filled_circle(self.screen, dot_x, dot_y, 3, self.AUDI_RED)
 
         # Draw turbo icon under BOOST title
         if title == "BOOST" and self._turbo_icon:
@@ -2153,7 +2202,7 @@ class BoostGaugeTest:
         indicator_style = gauge_config.get("indicator_style", "needle")
 
         # Draw the gauge with smoothed value
-        self._draw_generic_gauge(value, min_val, max_val, unit, label, color_zones, center_value, show_minor_numbers, show_minor_ticks, radial_bars, indicator_style)
+        self._draw_generic_gauge(value, min_val, max_val, unit, label, color_zones, center_value, show_minor_numbers, show_minor_ticks, radial_bars, indicator_style, pid=pid)
 
     def _get_unit_for_pid(self, pid, conversion="none"):
         """Get display unit for a PID."""
@@ -2705,20 +2754,32 @@ class BoostGaugeTest:
 
         # Note about brightness (removed - tight on space)
 
-        # Divider before power
-        pygame.draw.line(self.screen, self.AUDI_DIVIDER, (100, 300), (380, 300), 1)
+        # Divider before default gauge
+        pygame.draw.line(self.screen, self.AUDI_DIVIDER, (100, 295), (380, 295), 1)
 
-        # Power section label
-        power_label = self._font_small.render("Power", True, self.AUDI_WHITE)
-        power_rect = power_label.get_rect(center=(240, 325))
-        self.screen.blit(power_label, power_rect)
+        # Default Gauge selector
+        dg_label = self._font_small.render("Default Gauge", True, self.AUDI_WHITE)
+        dg_label_rect = dg_label.get_rect(midleft=(90, 320))
+        self.screen.blit(dg_label, dg_label_rect)
+
+        # Show current default gauge name with arrows
+        if self.gauge_configs and self.default_gauge < len(self.gauge_configs):
+            gauge_name = self.gauge_configs[self.default_gauge].get("label", f"Gauge {self.default_gauge}")
+        else:
+            gauge_name = "None"
+        dg_value = self._font_small.render(f"< {gauge_name} >", True, self.AUDI_RED)
+        dg_value_rect = dg_value.get_rect(midright=(390, 320))
+        self.screen.blit(dg_value, dg_value_rect)
+
+        # Divider before power
+        pygame.draw.line(self.screen, self.AUDI_DIVIDER, (100, 345), (380, 345), 1)
 
         # Shutdown button (left) - Audi red style
-        shutdown_btn_rect = pygame.Rect(70, 355, 150, 50)
+        shutdown_btn_rect = pygame.Rect(70, 370, 150, 45)
         self._draw_audi_button("SHUTDOWN", shutdown_btn_rect, active=True, color_scheme="red")
 
         # Reboot button (right) - Audi default style
-        reboot_btn_rect = pygame.Rect(260, 355, 150, 50)
+        reboot_btn_rect = pygame.Rect(260, 370, 150, 45)
         self._draw_audi_button("REBOOT", reboot_btn_rect, active=True, color_scheme="default")
 
         # Audi MMI navigation hints
