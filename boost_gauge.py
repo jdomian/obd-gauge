@@ -300,11 +300,10 @@ class BoostGaugeTest:
                 (0.85, 1.0, self.RED),     # High boost: +14 to +20 PSI (full send)
             ],
             'temp': [
-                (0.0, 0.25, self.BLUE),    # Cold: 100-140°F
-                (0.25, 0.5, self.CYAN),    # Warming: 140-180°F
-                (0.5, 0.75, self.GREEN),   # Normal: 180-220°F
-                (0.75, 0.81, self.YELLOW), # Warm: 220-230°F
-                (0.81, 1.0, self.RED),     # Hot: 230-260°F
+                (0.0, 0.558, self.BLUE),     # Cold: 0-145°F
+                (0.558, 0.692, self.ORANGE),  # Warming: 145-180°F
+                (0.692, 0.808, self.GREEN),   # Normal: 180-210°F
+                (0.808, 1.0, self.RED),       # Hot: 210-260°F
             ],
             'load': [
                 (0.0, 0.3, self.BLUE),     # Light
@@ -328,7 +327,7 @@ class BoostGaugeTest:
         # Default values at minimum (needle starts at bottom when not connected)
         self.simulated_values = {
             'BOOST': 0.0,  # Start at 0 (12 o'clock position)
-            'OIL_TEMP': 100.0,
+            'OIL_TEMP': 0.0,
             'ENGINE_LOAD': 0.0,
             'INTAKE_TEMP': 0.0,
             'RPM': 0.0,
@@ -483,6 +482,18 @@ class BoostGaugeTest:
             print(f"[Dial] Active background: {self.dial_background}")
         else:
             print(f"[Dial] Using procedural rendering (dial_background={self.dial_background})")
+
+        # Load turbo icon for boost gauge
+        self._turbo_icon = None
+        turbo_path = os.path.join(os.path.dirname(__file__), "assets", "icons", "turbo.png")
+        if os.path.exists(turbo_path):
+            try:
+                icon = pygame.image.load(turbo_path).convert_alpha()
+                icon = pygame.transform.smoothscale(icon, (40, 40))
+                self._turbo_icon = icon
+                print("[Icon] Loaded turbo icon")
+            except Exception as e:
+                print(f"[Icon] Failed to load turbo icon: {e}")
 
     def _init_hub_surface(self):
         """Pre-render center hub as a surface for fast blitting.
@@ -1975,7 +1986,7 @@ class BoostGaugeTest:
             # Draw arc from start angle to current value angle
             # Color changes based on current value's zone
             arc_radius = 210  # Same position as major ticks
-            arc_thickness = 20  # Same height as major ticks
+            arc_thickness = 30  # Thicker arc bar
             self._draw_arc(self.center, arc_radius, gauge_start_angle, angle, indicator_color, arc_thickness)
         else:
             # NEEDLE INDICATOR: Traditional thin tapered needle
@@ -2021,17 +2032,20 @@ class BoostGaugeTest:
         title_rect = title_surface.get_rect(center=(240, 105))
         self.screen.blit(title_surface, title_rect)
 
+        # Draw turbo icon under BOOST title
+        if title == "BOOST" and self._turbo_icon:
+            icon_rect = self._turbo_icon.get_rect(center=(240, 160))
+            self.screen.blit(self._turbo_icon, icon_rect)
+
     def _draw_temp_gauge(self, temp):
-        """Draw oil temperature gauge (100-260°F)."""
-        # Color zones: cold=blue, warming=cyan, normal=green, warm=yellow, hot=red
+        """Draw oil temperature gauge (0-260°F)."""
         color_zones = [
-            (0.0, 0.25, self.BLUE),    # Cold: 100-140°F
-            (0.25, 0.5, self.CYAN),    # Warming: 140-180°F
-            (0.5, 0.75, self.GREEN),   # Normal: 180-220°F
-            (0.75, 0.81, self.YELLOW), # Warm: 220-230°F
-            (0.81, 1.0, self.RED),     # Hot: 230-260°F
+            (0.0, 0.558, self.BLUE),     # Cold: 0-145°F
+            (0.558, 0.692, self.ORANGE),  # Warming: 145-180°F
+            (0.692, 0.808, self.GREEN),   # Normal: 180-210°F
+            (0.808, 1.0, self.RED),       # Hot: 210-260°F
         ]
-        self._draw_generic_gauge(temp, 100, 260, "°F", "OIL TEMP", color_zones)
+        self._draw_generic_gauge(temp, 0, 260, "°F", "OIL TEMP", color_zones)
 
     def _draw_load_gauge(self, load):
         """Draw engine load gauge (0-100%)."""

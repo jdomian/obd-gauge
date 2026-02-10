@@ -15,8 +15,9 @@
       "label": "OIL TEMP",
       "needle": "audi3",
       "conversion": "none",
+      "color_preset": "temp",
       "offset": -10,
-      "min": 100,
+      "min": 0,
       "max": 260,
       "radial_bars": [
         {
