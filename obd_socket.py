@@ -55,6 +55,8 @@ class OBDData:
     map_kpa: float = 101.0  # Atmospheric pressure
     coolant_temp_c: float = 0.0
     coolant_temp_f: float = 32.0
+    oil_temp_c: float = 0.0
+    oil_temp_f: float = 32.0
     rpm: int = 0
     speed_kph: int = 0
     speed_mph: int = 0
@@ -103,6 +105,7 @@ class OBDSocket:
         "0111": (1, "TPS", lambda x: x[0] * 100 // 255),  # Throttle Position (%)
         "0149": (1, "APP_D", lambda x: x[0] * 100 // 255),  # Accelerator Pedal Position D (%)
         "014A": (1, "APP_E", lambda x: x[0] * 100 // 255),  # Accelerator Pedal Position E (%)
+        "015C": (1, "OIL_TEMP", lambda x: x[0] - 40),  # Engine Oil Temperature (C)
     }
 
     # Atmospheric pressure baseline for boost calculation
@@ -486,6 +489,16 @@ class OBDSocket:
         if iat_c is not None:
             self.data.intake_temp_c = iat_c
 
+        # Query engine oil temperature (PID 015C)
+        oil_c = self.query_pid("015C")
+        if oil_c is not None:
+            self.data.oil_temp_c = oil_c
+            self.data.oil_temp_f = oil_c * 9/5 + 32
+        else:
+            # Fallback: use coolant as oil temp proxy if 015C not supported
+            self.data.oil_temp_c = self.data.coolant_temp_c
+            self.data.oil_temp_f = self.data.coolant_temp_f
+
         # Query accelerator pedal position (APP_D) - better than throttle plate position
         throttle = self.query_pid("0149")
         if throttle is not None:
@@ -526,6 +539,9 @@ class OBDSocket:
                 self.data.rpm = result
             elif pid == '010F':  # Intake air temp
                 self.data.intake_temp_c = result
+            elif pid == '015C':  # Engine oil temp
+                self.data.oil_temp_c = result
+                self.data.oil_temp_f = result * 9/5 + 32
 
         self.data.timestamp = time.time()
         return self.data

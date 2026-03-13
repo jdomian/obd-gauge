@@ -15,3 +15,7 @@ __pycache__/
 
 # External dependencies (cloned separately)
 HyperPixel2r/
+backups/
+*.pdf
+__pycache__/
+venv/

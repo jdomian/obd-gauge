@@ -419,6 +419,12 @@ class BoostGaugeTest:
 
                 print(f"[Settings] Display: fps={self.target_fps}, demo={self.demo_mode}, show_fps={self.show_fps}, dial={self.dial_background}, default_gauge={self.default_gauge}")
 
+                # Load shift light settings
+                shift = settings.get("shift_light", {})
+                if "shift_rpm" in shift:
+                    self.shift_rpm_target = shift["shift_rpm"]
+                    print(f"[Settings] Shift target: {self.shift_rpm_target} RPM")
+
                 # Load OBD settings
                 obd = settings.get("obd", {})
                 self.obd_rate_hz = obd.get("rate_hz", 25)
@@ -964,6 +970,19 @@ class BoostGaugeTest:
         thread = threading.Thread(target=scan_thread, daemon=True)
         thread.start()
 
+    def _save_shift_target(self):
+        """Save shift RPM target to settings.json."""
+        try:
+            settings_path = os.path.join(os.path.dirname(__file__), "config", "settings.json")
+            with open(settings_path, 'r') as f:
+                settings = json.load(f)
+            settings.setdefault("shift_light", {})["shift_rpm"] = self.shift_rpm_target
+            with open(settings_path, 'w') as f:
+                json.dump(settings, f, indent=2)
+            print(f"[Settings] Saved shift_rpm={self.shift_rpm_target}")
+        except Exception as e:
+            print(f"[Settings] Failed to save shift target: {e}")
+
     def _set_brightness(self, brightness):
         """Set display brightness (10-100%) via software dimming."""
         self.brightness = max(self.min_brightness, min(self.max_brightness, brightness))
@@ -1181,7 +1200,20 @@ class BoostGaugeTest:
 
     def _handle_tap(self, x, y):
         """Handle tap gesture - context-dependent actions."""
-        if self.screen_row == 1:
+        if self.screen_row == 0 and self.screen_col == len(self.gauge_configs):
+            # Shift light screen - +/- buttons to adjust redline
+            if y >= 420 and y <= 460:
+                if x < 170:
+                    # Minus button - decrease by 100 RPM
+                    self.shift_rpm_target = max(3000, self.shift_rpm_target - 100)
+                    print(f"Shift target: {self.shift_rpm_target} RPM")
+                    self._save_shift_target()
+                elif x > 310:
+                    # Plus button - increase by 100 RPM
+                    self.shift_rpm_target = min(8000, self.shift_rpm_target + 100)
+                    print(f"Shift target: {self.shift_rpm_target} RPM")
+                    self._save_shift_target()
+        elif self.screen_row == 1:
             # Bluetooth screen - tap zones for SCAN and PAIR/DISCONNECT
             # Reset disconnect confirm if tapping elsewhere
             if y <= 310 or x < 240:
@@ -2011,7 +2043,7 @@ class BoostGaugeTest:
         if indicator_style == "arc":
             # ARC INDICATOR: Animated radial arc from min to current value
             arc_radius = 210  # Same position as major ticks
-            arc_thickness = 30  # Thicker arc bar
+            arc_thickness = 40  # Thicker arc bar
 
             # Boost gauge cold engine logic: override color based on oil temp
             if pid == "BOOST":
@@ -2243,8 +2275,11 @@ class BoostGaugeTest:
         warning_start = self.shift_rpm_target - self.shift_rpm_warning
 
         # Determine screen color based on RPM
+        # Zones: black → yellow glow → yellow flash → solid red → red/white strobe
+        flash_zone_start = self.shift_rpm_target - 200  # 200 RPM before target: yellow flashing
+
         if rpm >= self.shift_rpm_target:
-            # OVER TARGET - BRIGHT RED or STROBE
+            # AT OR OVER TARGET
             if rpm > self.shift_rpm_target + 200:
                 # OVER-REV - RAPID STROBE (red/white)
                 strobe_period = 1.0 / self.shift_strobe_hz
@@ -2259,10 +2294,20 @@ class BoostGaugeTest:
             else:
                 # AT TARGET - SOLID BRIGHT RED
                 bg_color = (255, 0, 0)
+        elif rpm >= flash_zone_start:
+            # YELLOW FLASH ZONE - rapid yellow/black flashing (approaching redline)
+            flash_hz = 6 + ((rpm - flash_zone_start) / 200.0) * 8  # 6-14 Hz, faster as RPM rises
+            flash_period = 1.0 / flash_hz
+            if now - self.shift_last_flash >= flash_period:
+                self.shift_flash_state = not self.shift_flash_state
+                self.shift_last_flash = now
+            if self.shift_flash_state:
+                bg_color = (255, 255, 0)  # BRIGHT YELLOW
+            else:
+                bg_color = (0, 0, 0)  # BLACK
         elif rpm >= warning_start:
-            # WARNING ZONE - YELLOW GLOW (intensity increases approaching target)
-            warning_pct = (rpm - warning_start) / self.shift_rpm_warning
-            # Fade from dark to yellow
+            # WARNING ZONE - YELLOW GLOW (intensity increases approaching flash zone)
+            warning_pct = (rpm - warning_start) / (flash_zone_start - warning_start) if flash_zone_start > warning_start else 1.0
             intensity = int(warning_pct * 255)
             bg_color = (intensity, intensity, 0)  # Yellow
         else:
@@ -2286,19 +2331,18 @@ class BoostGaugeTest:
         rpm_rect = rpm_text.get_rect(center=(240, 400))
         self.screen.blit(rpm_text, rpm_rect)
 
-        # Shift target indicator (small)
-        target_text = self._font_tiny.render(f"SHIFT @ {self.shift_rpm_target}", True, text_color)
+        # Shift target with +/- adjustment buttons
+        minus_text = self._font_medium.render("-", True, text_color)
+        minus_rect = minus_text.get_rect(center=(100, 440))
+        self.screen.blit(minus_text, minus_rect)
+
+        target_text = self._font_small.render(f"SHIFT @ {self.shift_rpm_target}", True, text_color)
         target_rect = target_text.get_rect(center=(240, 440))
         self.screen.blit(target_text, target_rect)
 
-        # Draw circular mask to maintain round display appearance
-        # (Only draw edges to save performance - center is already filled)
-        for angle in range(0, 360, 2):
-            for r in range(220, 240):
-                x = int(240 + r * math.cos(math.radians(angle)))
-                y = int(240 + r * math.sin(math.radians(angle)))
-                if 0 <= x < 480 and 0 <= y < 480:
-                    self.screen.set_at((x, y), (0, 0, 0))
+        plus_text = self._font_medium.render("+", True, text_color)
+        plus_rect = plus_text.get_rect(center=(380, 440))
+        self.screen.blit(plus_text, plus_rect)
 
     def _draw_mini_gauge_preview(self, center_x, center_y, pid_info):
         """Draw a small preview gauge for PID selection."""
@@ -2877,7 +2921,7 @@ class BoostGaugeTest:
 
         # Update gauge targets from OBD data
         self.boost_target = data.boost_psi
-        self.oil_temp_target = data.coolant_temp_f  # Using coolant sensor as oil temp proxy
+        self.oil_temp_target = data.oil_temp_f  # Real oil temp (PID 015C)
 
         # Map engine load from other PIDs if available
         if data.throttle_pos > 0:
@@ -2885,7 +2929,7 @@ class BoostGaugeTest:
 
         # Update simulated values for settings preview
         self.simulated_values['BOOST'] = data.boost_psi
-        self.simulated_values['OIL_TEMP'] = data.coolant_temp_f  # Using coolant sensor as oil temp proxy
+        self.simulated_values['OIL_TEMP'] = data.oil_temp_f  # Real oil temp (PID 015C), falls back to coolant
         self.simulated_values['INTAKE_TEMP'] = data.intake_temp_c * 9/5 + 32  # C to F
         self.simulated_values['RPM'] = data.rpm
         self.simulated_values['THROTTLE_POS'] = data.throttle_pos
@@ -3017,7 +3061,7 @@ class BoostGaugeTest:
         pid_map = {
             "THROTTLE_POS": "0111",
             "BOOST": "010B",
-            "OIL_TEMP": "0105",  # Using coolant sensor PID as oil temp proxy
+            "OIL_TEMP": "015C",  # Engine Oil Temperature (real sensor, not coolant proxy)
             "RPM": "010C",
             "INTAKE_TEMP": "010F",
             "ENGINE_LOAD": "0104",
@@ -3220,7 +3264,16 @@ class BoostGaugeTest:
                     self.simulated_values['OIL_TEMP'] = self.oil_temp_target
                     self.simulated_values['ENGINE_LOAD'] = self.engine_load_target
                     self.simulated_values['INTAKE_TEMP'] = 70 + math.sin(t * 0.3) * 30  # 40-100°F
-                    self.simulated_values['RPM'] = 2000 + math.sin(t * 1.5) * 1500 + (2000 if self.boost_target > 5 else 0)
+                    # RPM sweep: idle 800 → past redline, using sawtooth wave
+                    rpm_cycle = (t % 8.0) / 8.0  # 8-second cycle, 0.0 to 1.0
+                    if rpm_cycle < 0.85:
+                        # Ramp up: 800 to shift_rpm_target + 400 (past redline)
+                        ramp_pct = rpm_cycle / 0.85
+                        self.simulated_values['RPM'] = 800 + ramp_pct * (self.shift_rpm_target + 400 - 800)
+                    else:
+                        # Quick drop back to idle (shift/decel)
+                        drop_pct = (rpm_cycle - 0.85) / 0.15
+                        self.simulated_values['RPM'] = (self.shift_rpm_target + 400) * (1 - drop_pct) + 800 * drop_pct
                     self.simulated_values['THROTTLE_POS'] = self._simulate_throttle(t)
                     self.simulated_values['FUEL_PRESSURE'] = 40 + math.sin(t * 0.8) * 15
                 # When OBD connected, data arrives via _obd_data_callback
