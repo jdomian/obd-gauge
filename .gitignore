@@ -19,3 +19,6 @@ backups/
 *.pdf
 __pycache__/
 venv/
+
+# Local backup snapshots (e.g. boost_gauge.py.pre-sysscreen)
+*.pre-*
